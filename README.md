@@ -11,6 +11,9 @@ It contains no game code or data. Each port reads everything it needs from the p
 
 Version: **0.2.0**. Licence: [MIT](LICENSE).
 
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-support-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/SickSartori)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/sicksartori)
+
 ## Why it exists
 
 sm2port started as a copy of mc3port's runtime. The two copies drifted apart, and every fix had to be made twice (or
