@@ -143,6 +143,12 @@ The library's tests: `test_core` (discs, XBE), `test_log`, `test_texture_pages`,
 - A fix that is good for every game goes here, not in the port; what belongs to one game goes through a hook.
 - No code from other ports or third parties without their licence.
 
+## Supporting the project
+
+xport and the ports built on it are free and always will be. If they are useful to you and you want to say thanks, you
+can support their author on [GitHub Sponsors](https://github.com/sponsors/SickSartori) or
+[Ko-fi](https://ko-fi.com/sicksartori).
+
 ## Licence
 
 [MIT](LICENSE). The games themselves, and everything the ports read from the player's disc, belong to their owners.
