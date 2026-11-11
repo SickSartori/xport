@@ -1,0 +1,7 @@
+build/
+
+# Plans, handoffs and drafts live in a separate private repository, never here.
+/projects/
+/ROADMAP.md
+/HANDOFF*.md
+/ISSUE-REPLIES*.md
