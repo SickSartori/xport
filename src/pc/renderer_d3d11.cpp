@@ -2545,7 +2545,8 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
     Target* target = draw.target;
     // A depth buffer sampled as a texture: copied as colour first (this binds its own state, so before ours).
     for (const TextureStage& stage : state.textures) {
-        if (stage.enabled && !g_targets.count(stage.descriptor.address)) refresh_depth_colour(stage.descriptor.address);
+        const uint32_t address = stage.descriptor.address;  // a set lookup: most draws sample no depth buffer
+        if (stage.enabled && g_zeta_addresses.count(address) && !g_targets.count(address)) refresh_depth_colour(address);
     }
     const uint32_t texture = state.textures[0].enabled ? state.textures[0].descriptor.address : 0;
     const RendererNarrowing hud = renderer_game_narrowing(surface, state.screen_left, state.screen_right,
