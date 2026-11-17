@@ -198,11 +198,15 @@ bool CombinerProgram::operator==(const CombinerProgram& other) const {
     return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+// Asked for every draw: four 32-bit lanes over whole words, which a 32-bit build multiplies in one instruction each
+// (a 64-bit FNV per byte was 148 calls to the library's 64-bit multiply, 5% of the GPU thread in a city).
 uint64_t combiner_hash(const CombinerProgram& program) {
-    const auto* bytes = reinterpret_cast<const uint8_t*>(&program);
-    uint64_t hash = 1469598103934665603ull;
-    for (size_t i = 0; i < sizeof(program); ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
-    return hash;
+    uint32_t words[sizeof(CombinerProgram) / 4];
+    std::memcpy(words, &program, sizeof(words));
+    uint32_t lane[4] = {0x811C9DC5u, 0x01000193u, 0x9E3779B1u, 0x85EBCA6Bu};
+    for (size_t i = 0; i < sizeof(words) / 4; ++i) lane[i & 3] = (lane[i & 3] ^ words[i]) * 0x01000193u;
+    const uint32_t low = lane[0] ^ (lane[2] * 0x9E3779B1u), high = lane[1] ^ (lane[3] * 0x85EBCA6Bu);
+    return static_cast<uint64_t>(high) << 32 | low;
 }
 
 std::string generate_pixel_shader(const CombinerProgram& p) {
