@@ -484,11 +484,19 @@ std::map<std::tuple<D3D11_CULL_MODE, bool, int, float>, ComPtr<ID3D11RasterizerS
 // <GAME>_FLIP_WINDING=1 inverts how NV2A's front-face winding maps onto D3D11 (for checking the convention).
 const bool g_flip_winding = GetEnvironmentVariableW(XPORT_ENV_W("FLIP_WINDING"), nullptr, 0) != 0;
 
+// Internal resolution: every render target is this many times the game's size in each direction, and drawn
+// scaled (positions arrive relative to the game's size, so only viewports, scissors, clears and copies change).
+// The picture is reduced to the window when presented: smoother edges and sharper detail (setting render_scale,
+// read when the renderer starts). It need not be whole: 1080 lines are 2.25 times the game's 480.
+float g_scale = 1;
+
 ID3D11RasterizerState* rasterizer_for(const DrawState& state) {
     // Polygon offset (NV2A: scale * slope + bias * smallest depth step; D3D11's D24 DepthBias counts the same steps).
+    // The slope is the depth change per pixel, so at g_scale times the pixels it is g_scale times smaller: the game's
+    // scale is multiplied back, or the offset falls short on surfaces seen at an angle (Spider-Man 2's decals).
     static const bool off = std::getenv(XPORT_ENV("NO_POLY_OFFSET")) != nullptr;  // debugging: ignore the game's offset
     const int bias = state.offset_fill && !off ? static_cast<int>(std::lround(state.offset_bias)) : 0;
-    const float slope = state.offset_fill && !off ? state.offset_scale : 0.0f;
+    const float slope = state.offset_fill && !off ? state.offset_scale * g_scale : 0.0f;
     if (!state.cull_enable && !bias && slope == 0.0f) return g_rasterizer.Get();
     constexpr uint32_t kCullFront = 0x404, kCullBack = 0x405, kFrontCcw = 0x901;
     const D3D11_CULL_MODE mode = !state.cull_enable            ? D3D11_CULL_NONE
@@ -664,14 +672,8 @@ ComPtr<ID3DBlob> compile(const char* source, size_t size, const char* profile, c
     return code;
 }
 
-// Internal resolution: every render target is this many times the game's size in each direction, and drawn
-// scaled (positions arrive relative to the game's size, so only viewports, scissors, clears and copies change).
-// The picture is reduced to the window when presented: smoother edges and sharper detail (setting render_scale,
-// read when the renderer starts). It need not be whole: 1080 lines are 2.25 times the game's 480. Texture sizes,
-// scissors and copies round with scaled(), the same everywhere, so that a colour and a depth target of the same
-// game size always match; viewports keep the exact value.
-float g_scale = 1;
-
+// Internal resolution (g_scale, above): texture sizes, scissors and copies round with scaled(), the same everywhere,
+// so that a colour and a depth target of the same game size always match; viewports keep the exact value.
 LONG scaled(uint32_t pixels) { return std::lround(static_cast<float>(pixels) * g_scale); }
 uint32_t scaled_size(uint32_t pixels) { return static_cast<uint32_t>(scaled(pixels)); }
 float scaled_float(uint32_t pixels) { return static_cast<float>(pixels) * g_scale; }
@@ -891,7 +893,10 @@ DepthTarget* get_depth_target(uint32_t address, uint32_t width, uint32_t height)
 // of the split screen gets its own). The depth is not linear and the game's projection is unknown, but 1 - depth is
 // proportional to 1/z, which varies linearly across the screen on a plane: comparing a pixel with the mean of two
 // opposite neighbours gives zero on flat surfaces and a positive value in creases, relative to the pixel's own
-// value whatever the scale. Large differences (an object in front of another) are left out, so outlines get no halo.
+// value whatever the scale. Large differences (an object in front of another) are left out, so outlines get no halo:
+// left out of the average too, not counted as open. Counted as open, they lightened a shaded wall wherever its
+// samples reached a figure in front of it: a pale box, the radius wide, around Midnight Club 3's pedestrians and
+// lamp posts at night.
 
 constexpr char kOcclusionPixelShader[] = R"(
 cbuffer Occlusion : register(b0) { float radius; float strength; float2 unused; };
@@ -902,7 +907,7 @@ float4 main(float4 position : SV_Position) : SV_Target {
     if (centre <= 1e-5) return 1;                      // cleared to the far plane: sky
     // The same directions for every pixel: turned per pixel instead, they left a grain that showed through
     // anything bright drawn where the occlusion is strong (MC3's neon glow under the car).
-    float occlusion = 0;
+    float occlusion = 0, counted = 0;
     [unroll] for (int i = 0; i < 12; ++i) {
         const float a = i * 0.2617994;                  // 15 degrees apart over a half turn
         const float r = radius * (0.35 + 0.65 * ((i * 5 + 3) % 12) / 11.0);
@@ -910,9 +915,12 @@ float4 main(float4 position : SV_Position) : SV_Target {
         const float one = 1 - depth.Load(int3(p + o, 0));
         const float two = 1 - depth.Load(int3(p - o, 0));
         const float crease = ((one + two) * 0.5 - centre) / centre;  // > 0: the pixel lies behind its neighbours
-        occlusion += saturate(crease * 40) * (1 - smoothstep(0.15, 0.4, crease));
+        const float weight = 1 - smoothstep(0.15, 0.4, crease);    // 0: across an outline
+        occlusion += saturate(crease * 40) * weight;
+        counted += weight;
     }
-    const float light = 1 - strength * occlusion / 12;
+    // At least 3 of 12: a pixel nearly surrounded by outlines stays lighter rather than take one direction's value.
+    const float light = 1 - strength * occlusion / max(counted, 3);
     return float4(light, light, light, 1);
 }
 )";
