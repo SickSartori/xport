@@ -64,12 +64,14 @@ struct PSInput {
     float fog : FOG;
 };
 // Positions arrive in coordinates of the render target times w; scale = (2 * pixels per coordinate / width, the same
-// down, a game's narrowing across (renderer_game_narrowing), the coordinate column it narrows towards).
-cbuffer Surface : register(b0) { float4 scale; };
+// down, a game's narrowing across (renderer_game_narrowing), the coordinate column it narrows towards); scale_y = the
+// same narrowing down (factor, row).
+cbuffer Surface : register(b0) { float4 scale; float4 scale_y; };
 PSInput main(VSInput i) {
     PSInput o;
     const float x = (i.position.x - scale.w * i.position.w) * scale.z + scale.w * i.position.w;
-    o.position = float4(x * scale.x - i.position.w, i.position.w - i.position.y * scale.y, i.position.z, i.position.w);
+    const float y = (i.position.y - scale_y.y * i.position.w) * scale_y.x + scale_y.y * i.position.w;
+    o.position = float4(x * scale.x - i.position.w, i.position.w - y * scale.y, i.position.z, i.position.w);
     o.d0 = i.d0;
     o.d1 = i.d1;
     o.t0 = i.t0;
@@ -95,7 +97,7 @@ struct PSInput {
     float4 t3 : TEXCOORD3;
     float fog : FOG;
 };
-cbuffer Surface : register(b0) { float4 scale; };
+cbuffer Surface : register(b0) { float4 scale; float4 scale_y; };
 cbuffer Draw : register(b2) { uint first; };  // byte offset of this draw's vertex data (changes every draw)
 ByteAddressBuffer vertex_data : register(t0);
 
@@ -157,7 +159,8 @@ float4 clip_position(float4 screen, float clip_max) {
     if (!is_finite(w) || abs(w) < 5.42101e-20) w = w < 0 ? -5.42101e-20 : 5.42101e-20;
     const float z = clip_max != 0 ? screen.z / clip_max : screen.z;
     const float x = (screen.x - scale.w) * scale.z + scale.w;
-    return float4(x * w * scale.x - w, w - screen.y * w * scale.y, z * w, w);
+    const float y = (screen.y - scale_y.y) * scale_y.x + scale_y.y;
+    return float4(x * w * scale.x - w, w - y * w * scale.y, z * w, w);
 }
 )";
 
@@ -513,6 +516,7 @@ ID3D11RasterizerState* rasterizer_for(const DrawState& state) {
 ComPtr<ID3D11Buffer> g_surface_constants;  // vertex shader: pixel-to-clip scale of the current target
 uint32_t g_surface_scale_width = 0, g_surface_scale_height = 0, g_surface_scale_pixels_x = 0, g_surface_scale_pixels_y = 0;
 float g_surface_scale_narrow = 1, g_surface_scale_anchor = 0;  // renderer_game_narrowing
+float g_surface_scale_narrow_y = 1, g_surface_scale_anchor_y = 0;
 ComPtr<ID3D11VertexShader> g_clear_vertex_shader;
 ComPtr<ID3D11PixelShader> g_clear_pixel_shader;
 ComPtr<ID3D11Buffer> g_clear_constants;
@@ -2265,7 +2269,7 @@ bool renderer_start(HWND window) {
     }
 
     D3D11_BUFFER_DESC surface_constants{};
-    surface_constants.ByteWidth = 16;
+    surface_constants.ByteWidth = 32;
     surface_constants.Usage = D3D11_USAGE_DEFAULT;
     surface_constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     g_device->CreateBuffer(&surface_constants, nullptr, &g_surface_constants);
@@ -2440,9 +2444,10 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
                                                           state.screen_top, state.screen_bottom, texture);
     if (g_surface_scale_width != target->width || g_surface_scale_height != target->height ||
         g_surface_scale_pixels_x != surface.pixels_x || g_surface_scale_pixels_y != surface.pixels_y ||
-        g_surface_scale_narrow != hud.factor || g_surface_scale_anchor != hud.anchor) {
-        const float scale[4] = {2.0f * surface.pixels_x / target->width, 2.0f * surface.pixels_y / target->height,
-                                hud.factor, hud.anchor};
+        g_surface_scale_narrow != hud.factor || g_surface_scale_anchor != hud.anchor ||
+        g_surface_scale_narrow_y != hud.factor_y || g_surface_scale_anchor_y != hud.anchor_y) {
+        const float scale[8] = {2.0f * surface.pixels_x / target->width, 2.0f * surface.pixels_y / target->height,
+                                hud.factor, hud.anchor, hud.factor_y, hud.anchor_y, 0, 0};
         g_context->UpdateSubresource(g_surface_constants.Get(), 0, nullptr, scale, 0, 0);
         g_surface_scale_width = target->width;
         g_surface_scale_height = target->height;
@@ -2450,6 +2455,8 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
         g_surface_scale_pixels_y = surface.pixels_y;
         g_surface_scale_narrow = hud.factor;
         g_surface_scale_anchor = hud.anchor;
+        g_surface_scale_narrow_y = hud.factor_y;
+        g_surface_scale_anchor_y = hud.anchor_y;
     }
     BoundState& bound = g_bound;
     if (!bound.valid) {
@@ -2478,8 +2485,10 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
     const auto clip_x0 = static_cast<uint32_t>(std::lround(hud.apply(static_cast<float>(surface.clip_x))));
     const auto clip_x1 =
         static_cast<uint32_t>(std::lround(hud.apply(static_cast<float>(surface.clip_x + surface.clip_width))));
-    const D3D11_RECT scissor{scaled(clip_x0), scaled(surface.clip_y), scaled(clip_x1),
-                             scaled(surface.clip_y + surface.clip_height)};
+    const auto clip_y0 = static_cast<uint32_t>(std::lround(hud.apply_y(static_cast<float>(surface.clip_y))));
+    const auto clip_y1 =
+        static_cast<uint32_t>(std::lround(hud.apply_y(static_cast<float>(surface.clip_y + surface.clip_height))));
+    const D3D11_RECT scissor{scaled(clip_x0), scaled(clip_y0), scaled(clip_x1), scaled(clip_y1)};
     if (!bound.valid || std::memcmp(&scissor, &bound.scissor, sizeof(scissor)) != 0) {
         g_context->RSSetScissorRects(1, &scissor);
         bound.scissor = scissor;

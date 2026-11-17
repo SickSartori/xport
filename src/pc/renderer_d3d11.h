@@ -175,7 +175,9 @@ uint64_t renderer_texture_hash(const uint8_t* data, size_t size);
 // A flat draw (or a clear) narrowed across towards a column, before the coordinates become pixels.
 struct RendererNarrowing {
     float factor = 1, anchor = 0;
+    float factor_y = 1, anchor_y = 0;  // the same down (Spider-Man 2's smaller minimap)
     float apply(float x) const { return anchor + (x - anchor) * factor; }
+    float apply_y(float y) const { return anchor_y + (y - anchor_y) * factor_y; }
 };
 // For each draw: its extent on the surface (left > right when it is not flat) and its first texture's address.
 RendererNarrowing renderer_game_narrowing(const SurfaceState& surface, float left, float right, float top, float bottom,
