@@ -1615,11 +1615,35 @@ void dump_frame(ID3D11Texture2D* texture, const char* prefix = "frame") {
         info.biBitCount = 32;
         std::fwrite(&header, sizeof(header), 1, file);
         std::fwrite(&info, sizeof(info), 1, file);
+        // Float targets (signed blending) as 8-bit BGRA, clamped, alpha kept: a light mask counted in alpha shows.
+        const auto half = [](uint16_t h) {
+            const int exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
+            const float magnitude = exponent ? std::ldexp(1.0f + mantissa / 1024.0f, exponent - 15)
+                                             : std::ldexp(mantissa / 1024.0f, -14);
+            return (h & 0x8000) ? -magnitude : magnitude;
+        };
+        const auto byte = [](float v) { return static_cast<uint8_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255)); };
+        std::vector<uint8_t> converted(row);
+        float alpha_low = 0, alpha_high = 0;
         for (uint32_t y = 0; y < desc.Height; ++y) {
-            std::fwrite(static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch, row, 1, file);
+            const uint8_t* line = static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+            if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                const auto* rgba = reinterpret_cast<const uint16_t*>(line);
+                for (uint32_t x = 0; x < desc.Width; ++x) {
+                    converted[x * 4 + 0] = byte(half(rgba[x * 4 + 2]));
+                    converted[x * 4 + 1] = byte(half(rgba[x * 4 + 1]));
+                    converted[x * 4 + 2] = byte(half(rgba[x * 4 + 0]));
+                    converted[x * 4 + 3] = byte(half(rgba[x * 4 + 3]));
+                    alpha_low = std::min(alpha_low, half(rgba[x * 4 + 3]));
+                    alpha_high = std::max(alpha_high, half(rgba[x * 4 + 3]));
+                }
+                line = converted.data();
+            }
+            std::fwrite(line, row, 1, file);
         }
         std::fclose(file);
-        log_line("renderer: saved %s", name);
+        log_line("renderer: saved %s (format %u, alpha %g to %g)", name, static_cast<unsigned>(desc.Format), alpha_low,
+                 alpha_high);
     }
     g_context->Unmap(staging.Get(), 0);
 }
