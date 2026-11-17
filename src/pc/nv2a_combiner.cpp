@@ -24,7 +24,8 @@ constexpr uint32_t kUniqueC1 = 1u << 16;
 constexpr uint32_t kClampSum = 0x80, kComplementV1 = 0x40, kComplementR0 = 0x20;
 
 // Texture modes (PS_TEXTUREMODES_*).
-constexpr uint32_t kModeNone = 0x0, kModeProject2d = 0x1, kModeProject3d = 0x2, kModePassthrough = 0x4;
+constexpr uint32_t kModeNone = 0x0, kModeProject2d = 0x1, kModeProject3d = 0x2, kModePassthrough = 0x4,
+                   kModeDependentAr = 0xF, kModeDependentGb = 0x10;
 
 std::string format(const char* text, ...) {
     char buffer[512];
@@ -172,6 +173,13 @@ std::string texture_fetch(uint32_t mode, int stage) {
                 "texture_scale[%d].xy))",
                 stage, stage, stage, stage, stage, stage);
         case kModePassthrough: return format("saturate(input.t%d)", stage);
+        // The previous stage's texel picks the coordinates: alpha and red, or green and blue (Spider-Man 2 fades its
+        // shadows with distance this way, the depth buffer read as a texture looking up a ramp).
+        case kModeDependentAr:
+        case kModeDependentGb:
+            if (stage == 0) return "float4(0, 0, 0, 0)";
+            return format("texture%d.Sample(sampler%d, t%d.%s)", stage, stage, stage - 1,
+                          mode == kModeDependentAr ? "ar" : "gb");
         default: {
             // Cube maps, bump mapping and dot-product modes: not yet (logged once per mode).
             static uint32_t reported = 0;

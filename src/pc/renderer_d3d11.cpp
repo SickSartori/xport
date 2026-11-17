@@ -955,6 +955,78 @@ void apply_occlusion(Target& target, DepthTarget& depth) {
     g_context->PSSetShaderResources(0, 1, &none);
 }
 
+// --- the depth buffer read as a colour texture ---
+//
+// Spider-Man 2 fades its stencil shadows with distance: a quad over the frame samples the depth buffer as an A8R8G8B8
+// texture, and the next stage looks up a ramp with its alpha and red. The D24S8 word reads as A = depth bits 23..16,
+// R = 15..8, G = 7..0, B = the stencil. The NV2A's depth stays on the GPU here, so the draw got whatever was in that
+// memory: the shadow at full strength everywhere the stencil said shadow, as dark blocks on the sky and far walls.
+
+constexpr char kDepthColourPixelShader[] = R"(
+Texture2D<float> depth : register(t0);
+float4 main(float4 position : SV_Position) : SV_Target {
+    const uint d = (uint)round(depth.Load(int3(position.xy, 0)) * 16777215.0);
+    return float4((d >> 8) & 255, d & 255, 0, d >> 16) / 255.0;  // shortcut: stencil (B) left 0, nothing reads it yet
+}
+)";
+ComPtr<ID3D11PixelShader> g_depth_colour_pixel_shader;
+std::unordered_map<uint32_t, Target> g_depth_colours;  // by depth buffer address, made again by each draw reading it
+
+// The depth buffer at `address` (the largest when there are several sizes), or null.
+DepthTarget* depth_target_at(uint32_t address) {
+    DepthTarget* found = nullptr;
+    for (auto& [key, depth] : g_depth_targets) {
+        if (static_cast<uint32_t>(key) == address && depth.srv && (!found || depth.width > found->width)) found = &depth;
+    }
+    return found;
+}
+
+// For a draw that samples a depth buffer: its contents now, as colour, for texture_view.
+void refresh_depth_colour(uint32_t address) {
+    DepthTarget* depth = depth_target_at(address);
+    if (!depth || !g_depth_colour_pixel_shader) return;
+    const ForgetBound forget;
+    Target& colour = g_depth_colours[address];
+    if (!colour.texture || colour.width != depth->width || colour.height != depth->height) {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = scaled_size(depth->width);
+        desc.Height = scaled_size(depth->height);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        colour = Target{};
+        if (const HRESULT hr = g_device->CreateTexture2D(&desc, nullptr, &colour.texture); FAILED(hr)) {
+            log_resource_failure("a depth buffer read as colour", hr, desc);
+            return;
+        }
+        g_device->CreateRenderTargetView(colour.texture.Get(), nullptr, &colour.rtv);
+        g_device->CreateShaderResourceView(colour.texture.Get(), nullptr, &colour.srv);
+        colour.width = depth->width;
+        colour.height = depth->height;
+        colour.format = desc.Format;
+    }
+    ID3D11RenderTargetView* rtv = colour.rtv.Get();
+    g_context->OMSetRenderTargets(1, &rtv, nullptr);  // unbinds the depth buffer, which is read
+    g_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g_context->OMSetDepthStencilState(nullptr, 0);
+    const D3D11_VIEWPORT viewport{0, 0, scaled_float(colour.width), scaled_float(colour.height), 0, 1};
+    g_context->RSSetViewports(1, &viewport);
+    const D3D11_RECT all{0, 0, scaled(colour.width), scaled(colour.height)};
+    g_context->RSSetScissorRects(1, &all);
+    g_context->RSSetState(g_rasterizer.Get());
+    g_context->IASetInputLayout(nullptr);
+    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_context->VSSetShader(g_clear_vertex_shader.Get(), nullptr, 0);
+    g_context->PSSetShader(g_depth_colour_pixel_shader.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* source = depth->srv.Get();
+    g_context->PSSetShaderResources(0, 1, &source);
+    g_context->Draw(3, 0);
+    ID3D11ShaderResourceView* none = nullptr;
+    g_context->PSSetShaderResources(0, 1, &none);
+}
+
 D3D11_BLEND blend_factor(uint32_t gl) {
     switch (gl) {
         case 0x0000: return D3D11_BLEND_ZERO;
@@ -1214,6 +1286,7 @@ ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
     // A texture that is a render target (render to texture) is sampled from the GPU copy.
     const auto target = g_targets.find(d.address);
     if (target != g_targets.end()) return target->second.srv.Get();
+    if (const auto depth = g_depth_colours.find(d.address); depth != g_depth_colours.end()) return depth->second.srv.Get();
 
     uint32_t width = 0, height = 0, bytes = 0;
     if (!texture_extent(d, &width, &height, &bytes)) return nullptr;
@@ -2160,6 +2233,8 @@ bool renderer_start(HWND window) {
     pixel(kBlurPixelShader, sizeof(kBlurPixelShader) - 1, "bloom blur pixel", g_blur_pixel_shader);
     pixel(kFinalPixelShader, sizeof(kFinalPixelShader) - 1, "final pixel", g_final_pixel_shader);
     pixel(kOcclusionPixelShader, sizeof(kOcclusionPixelShader) - 1, "occlusion pixel", g_occlusion_pixel_shader);
+    pixel(kDepthColourPixelShader, sizeof(kDepthColourPixelShader) - 1, "depth as colour pixel",
+          g_depth_colour_pixel_shader);
     D3D11_BUFFER_DESC occlusion_constants{};
     occlusion_constants.ByteWidth = sizeof(OcclusionConstants);
     occlusion_constants.Usage = D3D11_USAGE_DEFAULT;
@@ -2355,6 +2430,10 @@ ID3D11ShaderResourceView* target_copy(const Target& target) {
 // Render target, viewport, scissor, raster, blend, depth state, combiner constants, textures and samplers.
 void bind_draw_state(const SurfaceState& surface, const DrawState& state, const PreparedDraw& draw) {
     Target* target = draw.target;
+    // A depth buffer sampled as a texture: copied as colour first (this binds its own state, so before ours).
+    for (const TextureStage& stage : state.textures) {
+        if (stage.enabled && !g_targets.count(stage.descriptor.address)) refresh_depth_colour(stage.descriptor.address);
+    }
     const uint32_t texture = state.textures[0].enabled ? state.textures[0].descriptor.address : 0;
     const RendererNarrowing hud = renderer_game_narrowing(surface, state.screen_left, state.screen_right,
                                                           state.screen_top, state.screen_bottom, texture);
@@ -2435,10 +2514,16 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
     CombinerConstants constants_data = state.constants;
     for (int i = 0; i < 4; ++i) {
         if (!state.textures[i].enabled || !texture_is_linear(state.textures[i].descriptor)) continue;
-        const auto rendered = g_targets.find(state.textures[i].descriptor.address);
-        if (rendered == g_targets.end()) continue;
-        constants_data.texture_scale[i][0] = 1.0f / rendered->second.width;
-        constants_data.texture_scale[i][1] = 1.0f / rendered->second.height;
+        const uint32_t address = state.textures[i].descriptor.address;
+        const Target* rendered = nullptr;
+        if (const auto found = g_targets.find(address); found != g_targets.end()) {
+            rendered = &found->second;
+        } else if (const auto depth = g_depth_colours.find(address); depth != g_depth_colours.end()) {
+            rendered = &depth->second;
+        }
+        if (!rendered) continue;
+        constants_data.texture_scale[i][0] = 1.0f / rendered->width;
+        constants_data.texture_scale[i][1] = 1.0f / rendered->height;
     }
     renderer_game_draw(surface, state, constants_data.alpha_reference);  // a game's own fades (MC3's blurs)
     if (!bound.valid || std::memcmp(&constants_data, &bound.constants, sizeof(constants_data)) != 0) {
