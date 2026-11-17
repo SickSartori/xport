@@ -683,7 +683,10 @@ float scaled_float(uint32_t pixels) { return static_cast<float>(pixels) * g_scal
     const HRESULT reason = g_device ? g_device->GetDeviceRemovedReason() : hr;
     log_line("renderer: the graphics card stopped responding: %08lX, reason %08lX", hr, reason);
     const bool restart = !GetEnvironmentVariableW(kRestarted, nullptr, 0);
-    if (!GetEnvironmentVariableW(XPORT_ENV_W("NO_DIALOG"), nullptr, 0)) {
+    // No box in RecompLauncher's Big Picture mode: behind its full screen a controller could not close it.
+    wchar_t launcher_mode[16] = {};
+    GetEnvironmentVariableW(L"RECOMPLAUNCHER_MODE", launcher_mode, 16);
+    if (!GetEnvironmentVariableW(XPORT_ENV_W("NO_DIALOG"), nullptr, 0) && wcscmp(launcher_mode, L"bigpicture") != 0) {
         MessageBoxA(nullptr,
                     restart ? "The graphics card stopped responding, so the game has to start again. Progress since "
                               "your last save is lost.\n\nIf it happens again, update the graphics driver or lower "
@@ -691,6 +694,13 @@ float scaled_float(uint32_t pixels) { return static_cast<float>(pixels) * g_scal
                             : "The graphics card stopped responding again. Update the graphics driver or lower the "
                               "resolution in the settings, then start " XPORT_NAME " again.",
                     XPORT_NAME, MB_ICONERROR | MB_OK);
+    }
+    // Started by RecompLauncher, <port>.exe stays as the process it watches and starts the next one itself (the port's
+    // restart_codes.h: <PORT>_EXIT_RESTART_AFTER_GPU_LOSS, with RESTARTED_AFTER_GPU_LOSS set).
+    if (restart && GetEnvironmentVariableW(XPORT_ENV_W("SUPERVISED"), nullptr, 0)) {
+        log_line("renderer: starting again through " XPORT_NAME "'s supervisor");
+        AllowSetForegroundWindow(ASFW_ANY);
+        end_process(0x52530004);
     }
     if (restart) {
         wchar_t path[MAX_PATH] = {};
