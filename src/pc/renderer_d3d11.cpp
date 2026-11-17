@@ -1006,6 +1006,7 @@ void refresh_depth_colour(uint32_t address) {
         colour.width = depth->width;
         colour.height = depth->height;
         colour.format = desc.Format;
+        log_line("renderer: depth buffer at %08X (%ux%u) read as a texture", address, depth->width, depth->height);
     }
     ID3D11RenderTargetView* rtv = colour.rtv.Get();
     g_context->OMSetRenderTargets(1, &rtv, nullptr);  // unbinds the depth buffer, which is read
