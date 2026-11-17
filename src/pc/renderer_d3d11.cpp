@@ -551,6 +551,8 @@ ComPtr<ID3D11SamplerState> g_present_sampler;
 
 std::unordered_map<uint32_t, Target> g_targets;
 std::unordered_map<uint64_t, DepthTarget> g_depth_targets;
+std::unordered_set<uint32_t> g_zeta_addresses;   // memory used as a depth buffer
+std::unordered_set<uint32_t> g_colour_over_zeta;  // ... that a draw has since drawn colour into (colour_to_depth)
 std::unordered_map<uint64_t, ComPtr<ID3D11PixelShader>> g_pixel_shaders;
 std::map<TextureKey, CachedTexture> g_textures;
 uint64_t g_texture_clock = 0;  // frames shown, for forgetting the textures no draw asks for any more
@@ -841,6 +843,7 @@ void make_float_target(Target& target, uint32_t address) {
 
 // Depth buffers must match their render target's size exactly in D3D11: one per address and size.
 DepthTarget* get_depth_target(uint32_t address, uint32_t width, uint32_t height) {
+    g_zeta_addresses.insert(address);
     DepthTarget& target = g_depth_targets[(static_cast<uint64_t>(width) << 48) | (static_cast<uint64_t>(height) << 32) |
                                           address];
     if (target.texture && target.width == width && target.height == height) return &target;
@@ -1032,6 +1035,50 @@ void refresh_depth_colour(uint32_t address) {
     g_context->PSSetShaderResources(0, 1, &none);
 }
 
+// The other way: colour drawn into memory that a later draw uses as its depth buffer. Midnight Club 3 copies its
+// scene's depth (read as colour, above) into a half-size surface, then tests its headlights' light volumes against
+// that memory as a depth buffer. Here the two are different textures, so the light volumes were tested against an
+// empty depth buffer and lit nothing. The colour's A, R and G are the depth's three bytes (D24S8, high byte first).
+constexpr char kColourToDepthPixelShader[] = R"(
+Texture2D colour : register(t0);
+float main(float4 position : SV_Position) : SV_Depth {
+    const float4 c = round(colour.Load(int3(position.xy, 0)) * 255);
+    return (c.a * 65536 + c.r * 256 + c.g) / 16777215;  // shortcut: B, the stencil, is left out; nothing reads it yet
+}
+)";
+ComPtr<ID3D11PixelShader> g_colour_to_depth_pixel_shader;
+ComPtr<ID3D11DepthStencilState> g_depth_overwrite;
+
+void colour_to_depth(Target& colour, DepthTarget& depth, uint32_t address) {
+    if (!g_colour_to_depth_pixel_shader || colour.width != depth.width || colour.height != depth.height) return;
+    const ForgetBound forget;
+    if (!g_depth_overwrite) {
+        D3D11_DEPTH_STENCIL_DESC desc{};
+        desc.DepthEnable = TRUE;
+        desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        g_device->CreateDepthStencilState(&desc, &g_depth_overwrite);
+        log_line("renderer: colour drawn at %08X used as a depth buffer (%ux%u)", address, depth.width, depth.height);
+    }
+    ID3D11ShaderResourceView* none[4] = {};
+    g_context->PSSetShaderResources(0, 4, none);  // the colour may still be bound as a texture
+    g_context->OMSetRenderTargets(0, nullptr, depth.dsv.Get());
+    g_context->OMSetDepthStencilState(g_depth_overwrite.Get(), 0);
+    const D3D11_VIEWPORT viewport{0, 0, scaled_float(depth.width), scaled_float(depth.height), 0, 1};
+    g_context->RSSetViewports(1, &viewport);
+    const D3D11_RECT all{0, 0, scaled(depth.width), scaled(depth.height)};
+    g_context->RSSetScissorRects(1, &all);
+    g_context->RSSetState(g_rasterizer.Get());
+    g_context->IASetInputLayout(nullptr);
+    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_context->VSSetShader(g_clear_vertex_shader.Get(), nullptr, 0);
+    g_context->PSSetShader(g_colour_to_depth_pixel_shader.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* source = colour.srv.Get();
+    g_context->PSSetShaderResources(0, 1, &source);
+    g_context->Draw(3, 0);
+    g_context->PSSetShaderResources(0, 1, none);
+}
+
 D3D11_BLEND blend_factor(uint32_t gl) {
     switch (gl) {
         case 0x0000: return D3D11_BLEND_ZERO;
@@ -1065,14 +1112,24 @@ D3D11_BLEND_OP blend_operation(uint32_t gl) {
     switch (gl) {
         case 0x800A: return D3D11_BLEND_OP_SUBTRACT;
         case 0x800B: return D3D11_BLEND_OP_REV_SUBTRACT;
-        // Xbox "signed" equations (D3DBLENDOP_REVSUBTRACTSIGNED / ADDSIGNED): the result may go below zero and come
-        // back (light volumes count faces this way). They are drawn into a float target, which does not clamp.
-        case 0xF005: return D3D11_BLEND_OP_REV_SUBTRACT;
-        case 0xF006: return D3D11_BLEND_OP_ADD;
+        // Xbox "signed" equations (D3DBLENDOP_REVSUBTRACTSIGNED / ADDSIGNED): see signed_source below; the 1.0 they
+        // are sent counts as -1/255, so subtracting it adds. Drawn into a float target, which does not clamp.
+        case 0xF005: return D3D11_BLEND_OP_ADD;
+        case 0xF006: return D3D11_BLEND_OP_REV_SUBTRACT;
         case 0x8007: return D3D11_BLEND_OP_MIN;
         case 0x8008: return D3D11_BLEND_OP_MAX;
         default: return D3D11_BLEND_OP_ADD;
     }
+}
+
+// The signed equations read the source as a two's complement byte (hardware tests, xemu issue 996): the 1.0 (0xFF)
+// that Midnight Club 3 sends to count its headlights' light volumes in alpha is -1/255, one step per face, so that
+// sixteen nested volumes make a soft pool of light. Taken as 1.0 the count saturated: no light, or solid white.
+// shortcut: weighted by a constant 1/255 with the operation swapped, exact for a source of 1.0 only (a source below
+// 0.5 counts positive on the Xbox); a game sending other values needs the conversion in the pixel shader.
+bool signed_source(const DrawState& state) {
+    return state.blend_enable && (state.blend_equation == 0xF005 || state.blend_equation == 0xF006) &&
+           state.blend_source == 1;
 }
 
 ID3D11BlendState* blend_state(const DrawState& state) {
@@ -1088,6 +1145,7 @@ ID3D11BlendState* blend_state(const DrawState& state) {
     rt.BlendOp = blend_operation(state.blend_equation);
     rt.SrcBlendAlpha = alpha_blend_factor(state.blend_source);
     rt.DestBlendAlpha = alpha_blend_factor(state.blend_destination);
+    if (signed_source(state)) rt.SrcBlend = rt.SrcBlendAlpha = D3D11_BLEND_BLEND_FACTOR;  // 1/255 (bind_draw_state)
     rt.BlendOpAlpha = rt.BlendOp;
     rt.RenderTargetWriteMask = static_cast<UINT8>(((state.color_mask & 0x10000) ? D3D11_COLOR_WRITE_ENABLE_RED : 0) |
                                                   ((state.color_mask & 0x100) ? D3D11_COLOR_WRITE_ENABLE_GREEN : 0) |
@@ -1624,6 +1682,7 @@ void dump_frame(ID3D11Texture2D* texture, const char* prefix = "frame") {
         };
         const auto byte = [](float v) { return static_cast<uint8_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255)); };
         std::vector<uint8_t> converted(row);
+        std::vector<float> alphas;  // a float target's alpha as it is, signed, in <name>.alpha (float32, rows)
         float alpha_low = 0, alpha_high = 0;
         for (uint32_t y = 0; y < desc.Height; ++y) {
             const uint8_t* line = static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
@@ -1636,12 +1695,19 @@ void dump_frame(ID3D11Texture2D* texture, const char* prefix = "frame") {
                     converted[x * 4 + 3] = byte(half(rgba[x * 4 + 3]));
                     alpha_low = std::min(alpha_low, half(rgba[x * 4 + 3]));
                     alpha_high = std::max(alpha_high, half(rgba[x * 4 + 3]));
+                    alphas.push_back(half(rgba[x * 4 + 3]));
                 }
                 line = converted.data();
             }
             std::fwrite(line, row, 1, file);
         }
         std::fclose(file);
+        if (!alphas.empty()) {
+            if (FILE* raw = std::fopen((std::string(name) + ".alpha").c_str(), "wb")) {
+                std::fwrite(alphas.data(), sizeof(float), alphas.size(), raw);
+                std::fclose(raw);
+            }
+        }
         log_line("renderer: saved %s (format %u, alpha %g to %g)", name, static_cast<unsigned>(desc.Format), alpha_low,
                  alpha_high);
     }
@@ -2264,6 +2330,8 @@ bool renderer_start(HWND window) {
     pixel(kOcclusionPixelShader, sizeof(kOcclusionPixelShader) - 1, "occlusion pixel", g_occlusion_pixel_shader);
     pixel(kDepthColourPixelShader, sizeof(kDepthColourPixelShader) - 1, "depth as colour pixel",
           g_depth_colour_pixel_shader);
+    pixel(kColourToDepthPixelShader, sizeof(kColourToDepthPixelShader) - 1, "colour to depth pixel",
+          g_colour_to_depth_pixel_shader);
     D3D11_BUFFER_DESC occlusion_constants{};
     occlusion_constants.ByteWidth = sizeof(OcclusionConstants);
     occlusion_constants.Usage = D3D11_USAGE_DEFAULT;
@@ -2410,9 +2478,15 @@ bool prepare_draw(const SurfaceState& surface, const DrawState& state, PreparedD
     }
     ID3D11PixelShader* shader = pixel_shader(state.program);
     if (!shader) return false;
+    if (g_zeta_addresses.count(surface.color_address)) g_colour_over_zeta.insert(surface.color_address);
     DepthTarget* depth = (surface.zeta_address && (state.depth_test || state.depth_write || state.stencil_test))
                              ? get_depth_target(surface.zeta_address, target->width, target->height)
                              : nullptr;
+    if (depth && g_colour_over_zeta.erase(surface.zeta_address)) {
+        if (const auto colour = g_targets.find(surface.zeta_address); colour != g_targets.end()) {
+            colour_to_depth(colour->second, *depth, surface.zeta_address);
+        }
+    }
     // Ambient occlusion between the 3D scene and what is drawn over it (the HUD keeps depth testing on, with
     // ALWAYS and no writes, so "3D" means comparing or writing depth).
     constexpr uint32_t kDepthAlways = 0x207;
@@ -2527,6 +2601,7 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
     const auto constant_alpha = [](uint32_t gl) { return gl == 0x8003 || gl == 0x8004; };
     float blend_color[4];
     std::memcpy(blend_color, state.blend_color, sizeof(blend_color));
+    if (signed_source(state)) std::fill(std::begin(blend_color), std::end(blend_color), 1.0f / 255);
     if (constant_alpha(state.blend_source) || constant_alpha(state.blend_destination)) {
         blend_color[0] = blend_color[1] = blend_color[2] = blend_color[3];
     }
