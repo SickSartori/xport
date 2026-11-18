@@ -36,7 +36,7 @@ updates the submodule.
 | `src/core` | Disc images (XDVDFS, split, CCI), XBE reading, the kernel export table. No Windows headers (`xportcore`). |
 | `src/pc` | The Windows runtime, see below. |
 | `tests` | The library's tests and the helpers (`test.h`, `disc_builder.h`) that the games' tests use too. |
-| `docs` | The logo. |
+| `docs` | The logo, and [`RENDERER_NOTES.md`](docs/RENDERER_NOTES.md): what the renderer emulates on purpose, what was tried and dropped, references (xemu, SpiderMan2-2004-NX), how to find a graphics defect. |
 | `xport.cmake` | The file a port includes to build the library. |
 
 `src/pc`, by topic:
@@ -114,7 +114,7 @@ sm2port. The library's own:
 |---|---|
 | Unattended runs | `NO_DIALOG`, `DUMP_FRAMES`, `DUMP_SECONDS`, `RESTART_FROM` |
 | Measurements and traces | `PROFILE`, `WATCHDOG`, `TRACE_KERNEL`, `TRACE_WAITS` |
-| Graphics debugging | `DUMP_2D`, `DUMP_TARGET`, `DUMP_TEXTURE`, `DUMP_WINDOW`, `TEX_LOG`, `TEX_LODBIAS`, `TEX_MAXLOD`, `ALWAYS_HASH`, `AO_VIEW`, `FLIP_WINDING`, `NO_POLY_OFFSET`, `TEST_PRESENT_HOOK` |
+| Graphics debugging | `DUMP_2D`, `DUMP_TARGET`, `DUMP_TEXTURE`, `DUMP_WINDOW`, `TEX_LOG`, `TEX_LODBIAS`, `TEX_MAXLOD`, `ALWAYS_HASH`, `AO_VIEW`, `FLIP_WINDING`, `NO_POLY_OFFSET`, `TEST_PRESENT_HOOK` (the ports add `DEBUG_FRAME_AT`, `DEBUG_PROBE`, `DUMP_DRAW` and the F9 key: see `docs/RENDERER_NOTES.md`) |
 | System | `GPU_PREFERENCE`, `LANGUAGE`, `MOVE_OLD_DATA` |
 
 Every setting in the game's `.ini` file can also be forced with `<PREFIX><KEY>` (`settings.h`).
