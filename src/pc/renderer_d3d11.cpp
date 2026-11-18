@@ -2704,6 +2704,12 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
         constants_data.texture_scale[i][0] = 1.0f / rendered->width;
         constants_data.texture_scale[i][1] = 1.0f / rendered->height;
     }
+    // z of texture_scale: the stage reads a depth buffer as colour (a dependent lookup after it fades over a longer
+    // distance, see dependent_depth in nv2a_combiner.cpp).
+    for (int i = 0; i < 4; ++i) {
+        constants_data.texture_scale[i][2] =
+            state.textures[i].enabled && g_depth_colours.count(state.textures[i].descriptor.address) ? 1.0f : 0.0f;
+    }
     renderer_game_draw(surface, state, constants_data.alpha_reference);  // a game's own fades (MC3's blurs)
     if (!bound.valid || std::memcmp(&constants_data, &bound.constants, sizeof(constants_data)) != 0) {
         g_context->UpdateSubresource(g_constants.Get(), 0, nullptr, &constants_data, 0, 0);
@@ -2716,7 +2722,16 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
     for (int i = 0; i < 4; ++i) {
         if (!state.textures[i].enabled) continue;
         views[i] = texture_view(state.textures[i], state.screen_left <= state.screen_right);
-        samplers[i] = sampler(state.textures[i]);
+        // A texture looked up with the previous stage's texel (Spider-Man 2's shadow fade: the depth's bytes pick a
+        // place on a ramp) is read with a linear filter, so the fade climbs smoothly instead of in 24 visible steps.
+        const uint32_t mode = (state.program.stage_program >> (5 * i)) & 0x1F;
+        if (mode == 0xF || mode == 0x10) {
+            TextureStage linear = state.textures[i];
+            linear.filter = (linear.filter & 0xFFFF) | 0x02020000;  // magnification and minification linear, no mipmaps
+            samplers[i] = sampler(linear);
+        } else {
+            samplers[i] = sampler(state.textures[i]);
+        }
         // The draw reads its own target: the NV2A then sees what is there now (MC3's motion blur writes its mask
         // into the frame's alpha this way). Direct3D cannot read and write one texture, so it reads a copy.
         if (views[i] == target->srv.Get()) {

@@ -178,8 +178,14 @@ std::string texture_fetch(uint32_t mode, int stage) {
         case kModeDependentAr:
         case kModeDependentGb:
             if (stage == 0) return "float4(0, 0, 0, 0)";
-            return format("texture%d.Sample(sampler%d, t%d.%s)", stage, stage, stage - 1,
-                          mode == kModeDependentAr ? "ar" : "gb");
+            // For AR the next byte, green, is the fraction between rows (with the depth read as colour, its lowest
+            // byte): the renderer's linear filter then blends the ramp's rows instead of stepping through them.
+            if (mode == kModeDependentAr) {
+                return format("(texture_scale[%d].z != 0 ? dependent_depth(texture%d, sampler%d, t%d)"
+                              " : dependent(texture%d, sampler%d, t%d.ar, t%d.g * 255 / 256))",
+                              stage - 1, stage, stage, stage - 1, stage, stage, stage - 1, stage - 1);
+            }
+            return format("dependent(texture%d, sampler%d, t%d.gb, 0)", stage, stage, stage - 1);
         default: {
             // Cube maps, bump mapping and dot-product modes: not yet (logged once per mode).
             static uint32_t reported = 0;
@@ -233,6 +239,30 @@ std::string generate_pixel_shader(const CombinerProgram& p) {
     for (int i = 0; i < 4; ++i) {
         code += format("Texture2D texture%d : register(t%d);\nSamplerState sampler%d : register(s%d);\n", i, i, i, i);
     }
+    // A dependent lookup: bytes b of the previous stage's texel read texel floor(b * size / 255), as the NV2A's
+    // coordinate b / 255 does with a nearest filter, at its centre; `fine` moves it towards the next row (by a part of
+    // one byte step) for the linear filter.
+    code += "float4 dependent(Texture2D t, SamplerState s, float2 bytes, float fine) {\n"
+            "    float2 size; t.GetDimensions(size.x, size.y);\n"
+            "    float2 texel = min(floor(round(bytes * 255) * size / 255), size - 1) + 0.5;\n"
+            "    texel.y = min(texel.y + fine * size.y / 255, size.y - 0.5);\n"
+            "    return t.Sample(s, texel / size);\n"
+            "}\n";
+    // The same after a depth buffer read as colour (A, R, G: the depth's three bytes, high first): Spider-Man 2 fades
+    // its shadows with distance this way, from full to none within a short span that showed as an arc around the
+    // camera. The lookup is averaged over 8 distances from half to twice the pixel's own (1 / (1 - depth) grows with
+    // the distance), which spreads the same fade over four times the span. A port's choice, not the console's.
+    code += "float4 dependent_depth(Texture2D t, SamplerState s, float4 depth) {\n"
+            "    const float d = dot(round(depth.arg * 255), float3(65536, 256, 1)) / 16777215;\n"
+            "    const float k = 1 / max(1 - d, 1e-7);\n"
+            "    float4 sum = 0;\n"
+            "    [unroll] for (int i = 0; i < 8; ++i) {\n"
+            "        const float v = saturate(1 - 1 / (k * exp2((i + 0.5) / 4 - 1))) * 16777215;\n"
+            "        const float a = floor(v / 65536), r = floor((v - a * 65536) / 256);\n"
+            "        sum += dependent(t, s, float2(a, r) / 255, (v - a * 65536 - r * 256) / 256);\n"
+            "    }\n"
+            "    return sum / 8;\n"
+            "}\n";
     code += "float4 main(PSInput input) : SV_Target {\n";
     code += "    float4 v0 = saturate(input.d0);\n";
     code += "    float4 v1 = saturate(input.d1);\n";
