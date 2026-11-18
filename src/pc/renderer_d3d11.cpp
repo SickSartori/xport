@@ -699,10 +699,7 @@ uint64_t change_hash(const uint8_t* data, size_t size) {
 ComPtr<ID3DBlob> compile(const char* source, size_t size, const char* profile, const char* name) {
     ComPtr<ID3DBlob> code, errors;
     ProfileScope scope(ProfileTime::shader_compile);
-    // Level 0: half the time of level 1 (the combiners are compiled on the GPU thread, the first time a scene needs
-    // them: 1.2 s against 0.6 s on entering Midnight Club 3's city), and the driver optimises the code again anyway;
-    // the frame rate is the same.
-    const HRESULT hr = D3DCompile(source, size, name, nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL0,
+    const HRESULT hr = D3DCompile(source, size, name, nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL1,
                                   0, &code, &errors);
     if (FAILED(hr)) {
         log_line("renderer: %s failed to compile: %s", name,

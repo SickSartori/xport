@@ -59,9 +59,11 @@ What the renderer does on purpose, what was tried and dropped, and how the defec
 
 - Combiner (pixel) shaders are compiled on the GPU thread the first time a draw needs one, and stall that frame;
   vertex programs on a thread of their own while the CPU draws with them. Both are kept in `shader_cache` and read
-  from there the next time. They are compiled at optimisation level 0: half the time of level 1 (Midnight Club 3's
-  city the first time: 73 combiners in 0.6 s instead of 1.2 s, the longest 14 ms instead of 38), the same frame rate,
-  since the driver optimises again. Skipping the optimisation altogether was slower than level 0.
+  from there the next time. With an empty cache: Midnight Club 3's start and city about 70 combiners and 12 programs,
+  Spider-Man 2's city about 35 and 30.
+- Compiled alone, one after the other (Spider-Man 2's sources, `d3dcompiler_47`): combiners 6 ms on average and 33 at
+  most, vertex programs 120 ms on average and 630 at most. Optimisation level 0 is no faster than level 1 (it seemed so
+  in game, where the runs differ by more than that: measure compiles outside the game).
 
 ## Finding a defect
 
