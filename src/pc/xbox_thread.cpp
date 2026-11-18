@@ -233,6 +233,74 @@ unsigned long emulation_cores() {
     return g_game_cores && others ? others : 0;
 }
 
+namespace {
+
+// Each processor core in the process's reach: its logical processors and how fast its kind is (Intel's P cores 1,
+// E cores 0; all 0 where every core is alike).
+struct Core {
+    DWORD_PTR mask;
+    uint8_t speed;
+};
+
+std::vector<Core> processor_cores() {
+    std::vector<Core> cores;
+    DWORD_PTR process_mask = 0, system_mask = 0;
+    DWORD size = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &size);
+    std::vector<uint8_t> buffer(size);
+    if (!size || !GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) ||
+        !GetLogicalProcessorInformationEx(
+            RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &size)) {
+        return cores;
+    }
+    for (DWORD offset = 0; offset + sizeof(DWORD) * 2 <= size;) {
+        const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+        if (!info->Size) break;
+        if (info->Relationship == RelationProcessorCore && info->Processor.GroupCount) {
+            const DWORD_PTR mask = static_cast<DWORD_PTR>(info->Processor.GroupMask[0].Mask) & process_mask;
+            if (mask) cores.push_back({mask, info->Processor.EfficiencyClass});
+        }
+        offset += info->Size;
+    }
+    return cores;
+}
+
+}  // namespace
+
+unsigned long fastest_cores() {
+    DWORD_PTR mask = 0;
+    uint8_t speed = 0;
+    for (const Core& core : processor_cores()) {
+        if (core.speed > speed) mask = 0, speed = core.speed;
+        if (core.speed == speed) mask |= core.mask;
+    }
+    return static_cast<unsigned long>(mask);
+}
+
+unsigned long gpu_cores() {
+    const DWORD_PTR others = emulation_cores();
+    if (!others) return 0;
+    DWORD_PTR mask = 0;
+    uint8_t speed = 0;
+    for (const Core& core : processor_cores()) {
+        if (core.mask & g_game_cores) continue;  // the game core's twin shares its speed with the game
+        if (core.speed > speed) mask = 0, speed = core.speed;
+        if (core.speed == speed) mask |= core.mask;
+    }
+    mask &= others;
+    return static_cast<unsigned long>(mask ? mask : others);
+}
+
+void run_at_full_speed() {
+    // Windows slows the threads of a window that is not in front, or of any program on battery saver, by moving them
+    // to the slow cores at a low clock (EcoQoS). A game that keeps running in the background says no.
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+}
+
 void start_game_code_thread(std::function<void()> body) {
     constexpr SIZE_T kStackSize = 1024 * 1024;
     auto* owned = new std::function<void()>(std::move(body));

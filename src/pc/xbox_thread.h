@@ -97,6 +97,15 @@ void log_game_threads(const char* reason);
 void set_game_cores(unsigned long mask);
 unsigned long emulation_cores();
 
+// Processors with fast and slow cores (Intel's P and E cores): the logical processors of the fastest kind, for the
+// game's core (0 when Windows does not say). And those for the GPU thread, the port's busiest: the fastest of
+// emulation_cores(), leaving out the twin (SMT) of the game's core, which would share one core's speed with the game.
+unsigned long fastest_cores();
+unsigned long gpu_cores();
+
+// The process keeps its full speed in the background and on battery saver (no EcoQoS).
+void run_at_full_speed();
+
 // Shared by every thread: the fields of KPROCESS the game reads through KTHREAD.ApcState.Process.
 uint8_t* xbox_process();
 
