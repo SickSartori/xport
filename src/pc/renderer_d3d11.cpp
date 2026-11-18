@@ -154,13 +154,18 @@ float fog_factor(float distance, bool enabled, uint mode, float4 params) {
 }
 
 // A screen-space position (pixels; w apart) to clip space, as to_render_vertex and then the main vertex shader do.
+// precise, here and in the vertex programs: the compiler may not fuse or reorder, so two draws of the same mesh with
+// different programs (a second pass with LEQUAL and no depth write, a stencil shadow volume) get the same depth.
 float4 clip_position(float4 screen, float clip_max) {
-    float w = screen.w;
+    precise float w = screen.w;
     if (!is_finite(w) || abs(w) < 5.42101e-20) w = w < 0 ? -5.42101e-20 : 5.42101e-20;
-    const float z = clip_max != 0 ? screen.z / clip_max : screen.z;
-    const float x = (screen.x - scale.w) * scale.z + scale.w;
-    const float y = (screen.y - scale_y.y) * scale_y.x + scale_y.y;
-    return float4(x * w * scale.x - w, w - y * w * scale.y, z * w, w);
+    precise const float z = clip_max != 0 ? screen.z / clip_max : screen.z;
+    // The NV2A keeps 4 fractional bits of a vertex's screen position (xemu's roundScreenCoords): nearly equal
+    // vertices of two meshes (a building's edge and its shadow volume's) land on the same spot, with no gap between.
+    precise const float x = (trunc(screen.x * 16) / 16 - scale.w) * scale.z + scale.w;
+    precise const float y = (trunc(screen.y * 16) / 16 - scale_y.y) * scale_y.x + scale_y.y;
+    precise const float4 clip = float4(x * w * scale.x - w, w - y * w * scale.y, z * w, w);
+    return clip;
 }
 )";
 
@@ -208,10 +213,10 @@ PSInput main(uint vertex : SV_VertexID) {
     const float4 diffuse = attribute(vertex, 3);
     const float4 specular = attribute(vertex, 4);
     const float4 eye = rows4(model_view[0], model_view[1], model_view[2], model_view[3], position);
-    const float4 p = rows4(composite[0], composite[1], composite[2], composite[3], position);
-    float w = p.w;
+    precise const float4 p = rows4(composite[0], composite[1], composite[2], composite[3], position);
+    precise float w = p.w;
     if (!is_finite(w) || abs(w) < 5.42101e-20) w = w < 0 ? -5.42101e-20 : 5.42101e-20;
-    const float3 screen = float3(p.x / w + viewport_offset.x, p.y / w + viewport_offset.y, p.z / w);
+    precise const float3 screen = float3(p.x / w + viewport_offset.x, p.y / w + viewport_offset.y, p.z / w);
 
     float4 out_diffuse, out_specular;
     if (settings.x & kLighting) {

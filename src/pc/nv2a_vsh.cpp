@@ -245,8 +245,9 @@ std::string VertexProgram::hlsl() const {
     for (uint32_t i = 0; i < kVshAttributes; ++i) {
         if (inputs & (1u << i)) add("    const float4 v%u = attribute(vertex, %u);\n", i, i);
     }
-    s += "    float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r9 = 0, r10 = 0, r11 = 0;\n";
-    for (uint32_t i = 0; i < kVshOutputs; ++i) add("    float4 o%u = float4(0, 0, 0, 1);\n", i);
+    // precise (see clip_position): the same mesh drawn by two programs must land on the same depth.
+    s += "    precise float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r9 = 0, r10 = 0, r11 = 0;\n";
+    for (uint32_t i = 0; i < kVshOutputs; ++i) add("    %sfloat4 o%u = float4(0, 0, 0, 1);\n", i == 0 ? "precise " : "", i);
     s += "    int a0 = 0;\n";
 
     for (const VshInstruction& in : instructions_) {
