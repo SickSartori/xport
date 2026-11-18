@@ -23,6 +23,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -394,17 +395,39 @@ struct DepthTarget {
     uint32_t width = 0, height = 0;
 };
 
+// Setting sharp_textures enlarges the scene's textures, over a thousand at once in a city: the bytes of the enlarged
+// ones alive, kept within a budget (a 32-bit program, and graphics cards with 2 GB). Counted down when its texture goes.
+uint64_t g_enlarged_bytes = 0;
+constexpr uint64_t kEnlargedBudget = 768ull << 20;
+struct EnlargedBytes {
+    uint32_t bytes = 0;
+    EnlargedBytes() = default;
+    EnlargedBytes(EnlargedBytes&& other) noexcept : bytes(std::exchange(other.bytes, 0)) {}
+    EnlargedBytes& operator=(EnlargedBytes&& other) noexcept {
+        g_enlarged_bytes -= bytes;
+        bytes = std::exchange(other.bytes, 0);
+        return *this;
+    }
+    ~EnlargedBytes() { g_enlarged_bytes -= bytes; }
+    void set(uint32_t now) {
+        g_enlarged_bytes += now;
+        g_enlarged_bytes -= bytes;
+        bytes = now;
+    }
+};
+
 struct CachedTexture {
     ComPtr<ID3D11Texture2D> texture;
     ComPtr<ID3D11ShaderResourceView> srv;
     uint64_t content_hash = 0;
     uint32_t checked_generation = 0;  // memory unchanged since this write-tracking generation
     TexturePageHashes page_hashes;
-    bool waiting = false;            // sharp_2d: the enlarged version is being made (Enlarger)
+    bool waiting = false;            // sharp_2d, sharp_textures: the enlarged version is being made (Enlarger)
+    EnlargedBytes enlarged;          // what the enlarged version takes
     uint64_t last_used = 0;          // g_texture_clock when a draw last asked for it
 };
 
-// By address, format, pitch, rectangle, palette and whether it is enlarged for 2D (setting sharp_2d).
+// By address, format, pitch, rectangle, palette and whether it is enlarged (settings sharp_2d and sharp_textures).
 using TextureKey = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool>;
 
 // sharp_2d: textures are enlarged on a thread of their own (texture_upscale.cpp), the original showing meanwhile:
@@ -412,13 +435,20 @@ using TextureKey = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, 
 // second.
 class Enlarger {
 public:
-    void request(const TextureKey& key, uint64_t hash, const TextureImage& image) {
+    // `scene`: a texture of the 3D scene. Those come by the hundred on entering a place, so they get more threads,
+    // below the game's in priority; the HUD's go first.
+    void request(const TextureKey& key, uint64_t hash, const TextureImage& image, bool scene,
+                 const std::vector<TextureImage>& lower) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!started_) {
-            std::thread([this] { run(); }).detach();
-            started_ = true;
+        const unsigned wanted = scene ? std::clamp(std::thread::hardware_concurrency() / 4, 1u, 3u) : 1u;
+        for (; started_ < wanted; ++started_) {
+            std::thread([this] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                run();
+            }).detach();
         }
-        queue_.push_back({key, hash, image});
+        if (scene) queue_.push_back({key, hash, image, scene, lower});
+        else queue_.push_front({key, hash, image, scene, {}});
         wake_.notify_one();
     }
     // True once the texture `key` with content `hash` is done; `levels` empty when it was not worth enlarging. A
@@ -444,6 +474,8 @@ private:
         TextureKey key;
         uint64_t hash;
         TextureImage image;
+        bool scene = false;
+        std::vector<TextureImage> lower;  // the game's own lower levels (scene)
     };
     void run() {
         for (;;) {
@@ -454,7 +486,7 @@ private:
                 job = std::move(queue_.front());
                 queue_.pop_front();
             }
-            std::vector<TextureImage> levels = upscale_2d_texture(job.image);
+            std::vector<TextureImage> levels = upscale_texture(job.image, job.scene, job.lower);
             std::lock_guard<std::mutex> lock(mutex_);
             done_[job.key] = {job.hash, std::move(levels)};
         }
@@ -463,7 +495,7 @@ private:
     std::condition_variable wake_;
     std::deque<Job> queue_;
     std::map<TextureKey, std::pair<uint64_t, std::vector<TextureImage>>> done_;
-    bool started_ = false;
+    unsigned started_ = 0;  // threads
 };
 Enlarger g_enlarger;
 
@@ -1364,11 +1396,14 @@ bool make_replacement(const std::filesystem::path& file, CachedTexture& cached) 
 }
 
 // `flat`: the draw is flat over the 3D scene (the HUD): with sharp_2d its textures are enlarged (texture_upscale.cpp),
-// and those the game names (renderer_game_enlarge); not the linear ones, which are addressed in texels.
+// and those the game names (renderer_game_enlarge); with sharp_textures those of the scene as well. Not the linear
+// ones, which are addressed in texels.
 ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
     const TextureDescriptor& d = stage.descriptor;
     static const bool sharp_2d = setting_at_start("sharp_2d") != 0;
-    const bool enlarge = (flat || renderer_game_enlarge(d)) && sharp_2d && !texture_is_linear(d);
+    static const bool sharp_textures = setting_at_start("sharp_textures") != 0;
+    const bool enlarge_2d = (flat || renderer_game_enlarge(d)) && sharp_2d;
+    const bool enlarge = (enlarge_2d || sharp_textures) && !texture_is_linear(d);
     // A texture that is a render target (render to texture) is sampled from the GPU copy.
     const auto target = g_targets.find(d.address);
     if (target != g_targets.end()) return target->second.srv.Get();
@@ -1401,6 +1436,16 @@ ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
     std::vector<TextureImage> larger;
     if (cached.waiting && g_enlarger.take(key, cached.content_hash, larger)) {
         cached.waiting = false;
+        uint64_t larger_bytes = 0;
+        for (const TextureImage& level : larger) larger_bytes += level.data.size();
+        // Past the budget the scene's textures stay as the game's; the HUD's few are always enlarged.
+        if (!enlarge_2d && g_enlarged_bytes + larger_bytes > kEnlargedBudget) {
+            larger.clear();
+            static bool logged = false;
+            if (!logged) log_line("renderer: %llu MB of enlarged textures, the rest stay as the game's",
+                                  static_cast<unsigned long long>(g_enlarged_bytes >> 20));
+            logged = true;
+        }
         if (!larger.empty()) {
             D3D11_TEXTURE2D_DESC desc{};
             desc.Width = larger[0].width;
@@ -1418,8 +1463,9 @@ ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
                 SUCCEEDED(g_device->CreateShaderResourceView(texture.Get(), nullptr, &srv))) {
                 cached.texture = texture;
                 cached.srv = srv;
+                cached.enlarged.set(static_cast<uint32_t>(larger_bytes));
             } else {
-                log_resource_failure("an enlarged 2D texture", E_FAIL, desc);
+                log_resource_failure("an enlarged texture", E_FAIL, desc);
             }
         }
     }
@@ -1551,9 +1597,9 @@ ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
     }
     g_device->CreateShaderResourceView(cached.texture.Get(), nullptr, &cached.srv);
     cached.content_hash = hash;
-    if (enlarge) {
+    if (enlarge && (enlarge_2d || g_enlarged_bytes < kEnlargedBudget)) {
         cached.waiting = true;
-        g_enlarger.request(key, hash, image);
+        g_enlarger.request(key, hash, image, !enlarge_2d, lower_levels);
     }
     return cached.srv.Get();
 }

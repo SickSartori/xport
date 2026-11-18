@@ -170,6 +170,16 @@ void test_enlarger() {
         for (size_t i = 0; i < level.data.size(); i += 4) CHECK(is(level.data.data() + i, 10, 20, 30, 255));
     }
 
+    // A texture of the scene: twice (four times up to 64), and its colour kept where alpha is 0 (there alpha is not
+    // opacity: premultiplied, a road's colour came out black).
+    CHECK(upscale_texture(bgra(256, 256), true)[0].width == 512);
+    CHECK(upscale_texture(bgra(128, 128), true)[0].width == 256);
+    CHECK(upscale_texture(bgra(64, 64), true)[0].width == 256);
+    for (size_t i = 0; i < solid.data.size(); i += 4) solid.data[i + 3] = 0;
+    for (const TextureImage& level : upscale_texture(solid, true)) {
+        for (size_t i = 0; i < level.data.size(); i += 4) CHECK(is(level.data.data() + i, 10, 20, 30, 0));
+    }
+
     // A sticker's diagonal stripe: no overshoot around the edge, and the steps of the small picture smoothed. White on
     // black: along the stripe, the enlarged edge must not stay a stair of two-texel treads.
     TextureImage stripe = bgra(64, 64);

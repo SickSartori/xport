@@ -7,7 +7,9 @@
 namespace xport::pc {
 namespace {
 
-// Colour premultiplied by its alpha, 0 to 1: interpolating it puts no fringe around transparent parts.
+// Colour premultiplied by its alpha, 0 to 1: interpolating it puts no fringe around transparent parts. Not for the
+// scene's textures (`straight`): there alpha is often something else (how much a road shines, a wall's light), and
+// where it was 0 the colour was lost: black blotches on roads and walls.
 struct Pixel {
     float r = 0, g = 0, b = 0, a = 0;
 };
@@ -21,16 +23,24 @@ float difference(Pixel x, Pixel y) {
 
 struct Image {
     int width = 0, height = 0;
+    // A texture of the scene: outside an edge comes the opposite one (they repeat), else the edge itself; and its
+    // colour is not premultiplied (from_bgra).
+    bool tiled = false;
     std::vector<Pixel> pixels;
     Pixel& at(int x, int y) { return pixels[static_cast<size_t>(y) * width + x]; }
-    Pixel get(int x, int y) const {  // the edge repeats outside
-        x = std::clamp(x, 0, width - 1), y = std::clamp(y, 0, height - 1);
+    Pixel get(int x, int y) const {
+        if (tiled) {
+            x = ((x % width) + width) % width, y = ((y % height) + height) % height;
+        } else {
+            x = std::clamp(x, 0, width - 1), y = std::clamp(y, 0, height - 1);
+        }
         return pixels[static_cast<size_t>(y) * width + x];
     }
 };
 
-Pixel from_bgra(const uint8_t* p) {
+Pixel from_bgra(const uint8_t* p, bool straight) {
     const float a = p[3] / 255.0f;
+    if (straight) return {p[2] / 255.0f, p[1] / 255.0f, p[0] / 255.0f, a};
     return {p[2] / 255.0f * a, p[1] / 255.0f * a, p[0] / 255.0f * a, a};
 }
 
@@ -66,7 +76,7 @@ void colour_block(const uint8_t* block, bool always_four, uint8_t out[16][4]) {
     }
 }
 
-Image decode_bc(const TextureImage& image) {
+Image decode_bc(const TextureImage& image, bool straight) {
     Image out;
     out.width = static_cast<int>(image.width), out.height = static_cast<int>(image.height);
     out.pixels.resize(static_cast<size_t>(out.width) * out.height);
@@ -97,7 +107,7 @@ Image decode_bc(const TextureImage& image) {
             }
             for (int i = 0; i < 16; ++i) {
                 const int x = bx * 4 + i % 4, y = by * 4 + i / 4;
-                if (x < out.width && y < out.height) out.at(x, y) = from_bgra(texels[i]);
+                if (x < out.width && y < out.height) out.at(x, y) = from_bgra(texels[i], straight);
             }
         }
     }
@@ -148,7 +158,7 @@ Pixel choose(Pixel along_a, float change_along_a, Pixel along_b, float change_al
 Image twice(const Image& in) {
     const int w = in.width, h = in.height;
     Image out;
-    out.width = w * 2, out.height = h * 2;
+    out.width = w * 2, out.height = h * 2, out.tiled = in.tiled;
     out.pixels.resize(static_cast<size_t>(out.width) * out.height);
     const auto P = [&](int x, int y) { return in.get(x, y); };
     for (int y = 0; y < h; ++y) {
@@ -171,7 +181,11 @@ Image twice(const Image& in) {
         }
     }
     const auto D = [&](int x, int y) {  // the centre to the lower right of texel (x, y)
-        x = std::clamp(x, 0, w - 1), y = std::clamp(y, 0, h - 1);
+        if (in.tiled) {
+            x = ((x % w) + w) % w, y = ((y % h) + h) % h;
+        } else {
+            x = std::clamp(x, 0, w - 1), y = std::clamp(y, 0, h - 1);
+        }
         return out.at(2 * x + 1, 2 * y + 1);
     };
     // The points between two texels across, and between two down: across or down, with the centres beside them.
@@ -206,7 +220,7 @@ Image twice(const Image& in) {
 
 Image half(const Image& in) {
     Image out;
-    out.width = std::max(1, in.width / 2), out.height = std::max(1, in.height / 2);
+    out.width = std::max(1, in.width / 2), out.height = std::max(1, in.height / 2), out.tiled = in.tiled;
     out.pixels.resize(static_cast<size_t>(out.width) * out.height);
     for (int y = 0; y < out.height; ++y) {
         for (int x = 0; x < out.width; ++x) {
@@ -225,7 +239,7 @@ TextureImage to_bgra(const Image& image) {
     out.data.resize(static_cast<size_t>(out.row_pitch) * out.height);
     for (size_t i = 0; i < image.pixels.size(); ++i) {
         const Pixel& p = image.pixels[i];
-        const float a = std::clamp(p.a, 0.0f, 1.0f), k = a > 0 ? 1 / a : 0;
+        const float a = std::clamp(p.a, 0.0f, 1.0f), k = image.tiled ? 1 : a > 0 ? 1 / a : 0;  // tiled: straight
         const auto byte = [](float v) { return static_cast<uint8_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255)); };
         out.data[i * 4 + 0] = byte(p.b * k);
         out.data[i * 4 + 1] = byte(p.g * k);
@@ -237,30 +251,62 @@ TextureImage to_bgra(const Image& image) {
 
 }  // namespace
 
-std::vector<TextureImage> upscale_2d_texture(const TextureImage& image) {
-    if (image.width < 4 || image.height < 4) return {};
-    const uint32_t largest = std::max(image.width, image.height);
-    if (largest > 512) return {};
-    Image picture;
+namespace {
+
+// The texture as pixels; false for a layout that is not read here.
+bool read_image(const TextureImage& image, bool scene, Image& picture) {
     if (image.layout == TextureLayout::Bgra8) {
         picture.width = static_cast<int>(image.width), picture.height = static_cast<int>(image.height);
         picture.pixels.resize(static_cast<size_t>(picture.width) * picture.height);
         for (int y = 0; y < picture.height; ++y) {
             for (int x = 0; x < picture.width; ++x) {
-                picture.at(x, y) = from_bgra(image.data.data() + static_cast<size_t>(y) * image.row_pitch + x * 4);
+                picture.at(x, y) = from_bgra(image.data.data() + static_cast<size_t>(y) * image.row_pitch + x * 4, scene);
             }
         }
     } else if (image.layout == TextureLayout::Bc1 || image.layout == TextureLayout::Bc2 ||
                image.layout == TextureLayout::Bc3) {
-        picture = decode_bc(image);
-        soften_block_borders(picture);
+        picture = decode_bc(image, scene);
     } else {
-        return {};
+        return false;
     }
-    // Four times for the small ones (icons, letters), twice for the larger (the map's tiles): about 1024 at most.
+    picture.tiled = scene;
+    return true;
+}
+
+}  // namespace
+
+std::vector<TextureImage> upscale_texture(const TextureImage& image, bool scene, const std::vector<TextureImage>& lower) {
+    if (image.width < 4 || image.height < 4) return {};
+    const uint32_t largest = std::max(image.width, image.height);
+    if (largest > 512) return {};
+    Image picture;
+    if (!read_image(image, scene, picture)) return {};
+    const Image original = picture;
+    if (image.layout != TextureLayout::Bgra8) soften_block_borders(picture);
+    // Four times for the small ones (icons, letters), twice for the larger (the map's tiles): about 1024 at most. The
+    // scene's textures twice, four times only the smallest: there are over a thousand of them at once.
     picture = twice(picture);
-    if (largest <= 128) picture = twice(picture);
     std::vector<TextureImage> levels{to_bgra(picture)};
+    if (largest <= (scene ? 64u : 128u)) {
+        picture = twice(picture);
+        levels.insert(levels.begin(), to_bgra(picture));
+    }
+    if (scene) {
+        // Below the enlarged levels come the game's own, as they are: from afar the scene looks as it did (the game's
+        // lower levels are not its top one made smaller: a road's are smoother and lighter, and with ours made from
+        // the top one roads and walls came out dark and noisy). Only from close is the picture new.
+        levels.push_back(to_bgra(original));
+        picture = original;
+        for (const TextureImage& level : lower) {
+            Image next;
+            if (level.width != static_cast<uint32_t>(std::max(1, picture.width / 2)) ||
+                level.height != static_cast<uint32_t>(std::max(1, picture.height / 2)) || !read_image(level, true, next)) {
+                break;
+            }
+            picture = next;
+            levels.push_back(to_bgra(picture));
+        }
+    }
     while (picture.width > 1 || picture.height > 1) {
         picture = half(picture);
         levels.push_back(to_bgra(picture));

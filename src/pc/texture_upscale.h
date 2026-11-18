@@ -12,7 +12,10 @@
 namespace xport::pc {
 
 // The enlarged texture's levels (BGRA8, the top one first, down to 1x1), or none when it is not worth it or the
-// layout is unknown.
-std::vector<TextureImage> upscale_2d_texture(const TextureImage& image);
+// layout is unknown. `scene`: a texture of the 3D scene (setting sharp_textures): it repeats across its edges, and is
+// enlarged less than the HUD's; `lower` are the game's own lower levels, kept below the enlarged ones.
+std::vector<TextureImage> upscale_texture(const TextureImage& image, bool scene,
+                                          const std::vector<TextureImage>& lower = {});
+inline std::vector<TextureImage> upscale_2d_texture(const TextureImage& image) { return upscale_texture(image, false); }
 
 }  // namespace xport::pc
