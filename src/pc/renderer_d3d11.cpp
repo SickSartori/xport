@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <future>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -630,6 +631,7 @@ struct Statistics {
     // Draw call.
     uint64_t part_ticks[5] = {};
     uint64_t swap_ticks = 0;  // in Present: long when the graphics card is behind
+    uint64_t shader_waits = 0;  // draws left out while their combiner shader compiles (pixel_shader)
 } g_stats;
 ULONGLONG g_stats_since = 0;
 
@@ -661,10 +663,11 @@ void log_statistics() {
              milliseconds(g_stats.upload_ticks) / seconds, milliseconds(g_stats.draw_ticks) / seconds,
              g_textures.size(), GetCurrentProcessorNumber());  // hybrid CPUs: which core this thread got
     log_line("renderer: D3D parts per second: setup %.0f ms, vertex upload %.0f ms, state and textures %.0f ms, "
-             "draw %.0f ms; Present %.0f ms",
+             "draw %.0f ms; Present %.0f ms; %llu draws waited for a shader",
              milliseconds(g_stats.part_ticks[0]) / seconds, milliseconds(g_stats.part_ticks[1]) / seconds,
              milliseconds(g_stats.part_ticks[2] + g_stats.part_ticks[3]) / seconds,
-             milliseconds(g_stats.part_ticks[4]) / seconds, milliseconds(g_stats.swap_ticks) / seconds);
+             milliseconds(g_stats.part_ticks[4]) / seconds, milliseconds(g_stats.swap_ticks) / seconds,
+             static_cast<unsigned long long>(g_stats.shader_waits));
     g_stats = {};
     g_stats_since = now;
 }
@@ -1674,20 +1677,24 @@ void preload_shaders() {
     }).detach();
 }
 
-ID3D11PixelShader* pixel_shader(const CombinerProgram& program) {
-    const uint64_t key = combiner_hash(program);
-    const auto it = g_pixel_shaders.find(key);
-    if (it != g_pixel_shaders.end()) return it->second.Get();
-    ComPtr<ID3D11PixelShader>& shader = g_pixel_shaders[key];
-    const std::string source = generate_pixel_shader(program);
-    // Compiled here, on the GPU thread (about 8 ms each, 70 on entering Midnight Club 3's city). From the second run on,
-    // read from disk.
-    const std::filesystem::path file = shader_cache_file("ps", source);
-    if ((shader = take_preloaded(g_preloaded_pixel, file))) return shader.Get();
-    const std::vector<char> stored = read_cached_shader(file);
-    if (!stored.empty() && SUCCEEDED(g_device->CreatePixelShader(stored.data(), stored.size(), nullptr, &shader))) {
-        return shader.Get();
+// A combiner shader not compiled yet (the first time a place is seen; afterwards shader_cache has it) is compiled on a
+// helper thread, two at a time. A draw that needs it waits while this frame's waits stay within kCompileWaitMs, and
+// past that is left out until the shader is ready: a few draws a frame or two late, instead of a pause (6 ms a shader
+// on average, 33 at most, 35 to 70 of them on entering a city). Set by renderer_present: g_compile_waited_ms.
+constexpr double kCompileWaitMs = 8;
+double g_compile_waited_ms = 0;  // in the current frame, GPU thread
+std::unordered_map<uint64_t, std::shared_future<ComPtr<ID3D11PixelShader>>> g_pixel_pending;
+std::mutex g_compile_mutex;
+std::condition_variable g_compile_free;
+int g_compiling = 0;
+
+ComPtr<ID3D11PixelShader> compile_pixel_shader(const std::string& source, const std::filesystem::path& file) {
+    {
+        std::unique_lock<std::mutex> lock(g_compile_mutex);
+        g_compile_free.wait(lock, [] { return g_compiling < 2; });
+        ++g_compiling;
     }
+    ComPtr<ID3D11PixelShader> shader;
     const uint64_t start = ticks();
     if (ComPtr<ID3DBlob> code = compile(source.c_str(), source.size(), "ps_5_0", "combiner")) {
         if (SUCCEEDED(g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader))) {
@@ -1701,7 +1708,44 @@ ID3D11PixelShader* pixel_shader(const CombinerProgram& program) {
     } else {
         log_line("%s", source.c_str());
     }
-    return shader.Get();
+    {
+        std::lock_guard<std::mutex> lock(g_compile_mutex);
+        --g_compiling;
+    }
+    g_compile_free.notify_one();
+    return shader;
+}
+
+ID3D11PixelShader* pixel_shader(const CombinerProgram& program) {
+    const uint64_t key = combiner_hash(program);
+    const auto it = g_pixel_shaders.find(key);
+    if (it != g_pixel_shaders.end()) return it->second.Get();
+    auto pending = g_pixel_pending.find(key);
+    if (pending == g_pixel_pending.end()) {
+        std::string source = generate_pixel_shader(program);
+        std::filesystem::path file = shader_cache_file("ps", source);
+        ComPtr<ID3D11PixelShader> shader = take_preloaded(g_preloaded_pixel, file);
+        const std::vector<char> stored = shader ? std::vector<char>{} : read_cached_shader(file);
+        if (!shader && !stored.empty()) g_device->CreatePixelShader(stored.data(), stored.size(), nullptr, &shader);
+        if (shader) return (g_pixel_shaders[key] = shader).Get();
+        pending = g_pixel_pending
+                      .emplace(key, std::async(std::launch::async, [source = std::move(source), file = std::move(file)] {
+                                        return compile_pixel_shader(source, file);
+                                    }).share())
+                      .first;
+    }
+    const uint64_t start = ticks();
+    const double left = std::max(kCompileWaitMs - g_compile_waited_ms, 0.0);
+    const bool ready =
+        pending->second.wait_for(std::chrono::duration<double, std::milli>(left)) == std::future_status::ready;
+    g_compile_waited_ms += milliseconds(ticks() - start);
+    if (!ready) {
+        ++g_stats.shader_waits;
+        return nullptr;  // the draw is left out this time
+    }
+    ComPtr<ID3D11PixelShader> shader = pending->second.get();
+    g_pixel_pending.erase(pending);
+    return (g_pixel_shaders[key] = shader).Get();  // null if it failed to compile: its draws stay out, as before
 }
 
 // <GAME>_DUMP_FRAMES=<n>: every n-th presented frame is read back and saved as frame-<count>.bmp next to the log,
@@ -3220,6 +3264,7 @@ void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_
     present_frame(frame_view, frame_desc.Width, frame_desc.Height);
     renderer_game_frame_shown();
     ++g_presented;
+    g_compile_waited_ms = 0;
     ++g_stats.presents;
     forget_unused_textures();
     log_statistics();

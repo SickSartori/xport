@@ -57,8 +57,11 @@ What the renderer does on purpose, what was tried and dropped, and how the defec
 
 ## Shaders
 
-- Combiner (pixel) shaders are compiled on the GPU thread the first time a draw needs one, and stall that frame;
-  vertex programs on a thread of their own while the CPU draws with them. Both are kept in `shader_cache` and read
+- Combiner (pixel) shaders not in the cache are compiled on two helper threads; a draw waits for its shader while the
+  frame's waits stay within 8 ms (`kCompileWaitMs`), and is left out past that until the shader is ready (the log's
+  "draws waited for a shader"). Alternating runs with an empty cache, Midnight Club 3: 31 and 33 fps synchronous
+  against 43 and 42 in the 10 s of entering the city, 28 and 31 against 33 and 39 at the start; nothing missing seen
+  in the frames of the start. Vertex programs compile on a thread of their own while the CPU draws with them. Both are kept in `shader_cache` and read
   from there the next time. With an empty cache: Midnight Club 3's start and city about 70 combiners and 12 programs,
   Spider-Man 2's city about 35 and 30.
 - Compiled alone, one after the other (Spider-Man 2's sources, `d3dcompiler_47`): combiners 6 ms on average and 33 at
