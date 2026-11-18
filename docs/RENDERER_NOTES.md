@@ -55,6 +55,14 @@ What the renderer does on purpose, what was tried and dropped, and how the defec
   as open they lit a pale box around Midnight Club 3's pedestrians and lamp posts at night. The "before the effects"
   frame dump already contains the AO (it is applied when the 3D scene ends): look at `AO_VIEW` before ruling it out.
 
+## Shaders
+
+- Combiner (pixel) shaders are compiled on the GPU thread the first time a draw needs one, and stall that frame;
+  vertex programs on a thread of their own while the CPU draws with them. Both are kept in `shader_cache` and read
+  from there the next time. They are compiled at optimisation level 0: half the time of level 1 (Midnight Club 3's
+  city the first time: 73 combiners in 0.6 s instead of 1.2 s, the longest 14 ms instead of 38), the same frame rate,
+  since the driver optimises again. Skipping the optimisation altogether was slower than level 0.
+
 ## Finding a defect
 
 - **F9** in the game opens the debug window for one second (one line per draw). With `<PREFIX>DUMP_DRAW=<texture>`

@@ -699,7 +699,10 @@ uint64_t change_hash(const uint8_t* data, size_t size) {
 ComPtr<ID3DBlob> compile(const char* source, size_t size, const char* profile, const char* name) {
     ComPtr<ID3DBlob> code, errors;
     ProfileScope scope(ProfileTime::shader_compile);
-    const HRESULT hr = D3DCompile(source, size, name, nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL1,
+    // Level 0: half the time of level 1 (the combiners are compiled on the GPU thread, the first time a scene needs
+    // them: 1.2 s against 0.6 s on entering Midnight Club 3's city), and the driver optimises the code again anyway;
+    // the frame rate is the same.
+    const HRESULT hr = D3DCompile(source, size, name, nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL0,
                                   0, &code, &errors);
     if (FAILED(hr)) {
         log_line("renderer: %s failed to compile: %s", name,
@@ -1680,7 +1683,8 @@ ID3D11PixelShader* pixel_shader(const CombinerProgram& program) {
     if (it != g_pixel_shaders.end()) return it->second.Get();
     ComPtr<ID3D11PixelShader>& shader = g_pixel_shaders[key];
     const std::string source = generate_pixel_shader(program);
-    // Compiled here, on the GPU thread: a quarter of a second on entering a city. From the second run on, read from disk.
+    // Compiled here, on the GPU thread (about 8 ms each, 70 on entering Midnight Club 3's city). From the second run on,
+    // read from disk.
     const std::filesystem::path file = shader_cache_file("ps", source);
     if ((shader = take_preloaded(g_preloaded_pixel, file))) return shader.Get();
     const std::vector<char> stored = read_cached_shader(file);
