@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -25,15 +26,23 @@ void mark(uint32_t first_page, uint32_t page_count, bool used) {
     for (uint32_t page = first_page; page < first_page + page_count; ++page) g_used[page] = used;
 }
 
+// Written under g_write_mutex; read without it (physical_write_generation is asked for every page of every texture
+// whose memory changed, and for every texture once a refresh: a lock each time was 2% of the GPU thread).
 std::mutex g_write_mutex;
-std::vector<uint32_t> g_page_generation(kPageCount, 1);
+std::atomic<uint32_t> g_page_generation[kPageCount];
+const bool g_page_generation_set = [] {
+    for (std::atomic<uint32_t>& generation : g_page_generation) generation.store(1, std::memory_order_relaxed);
+    return true;
+}();
 uint32_t g_generation = 1;
 std::vector<void*> g_written_pages(kPageCount);
 
 void mark_pages(uint32_t offset, uint32_t bytes, uint32_t generation) {
     if (!bytes || offset >= kPhysicalMemorySize) return;
     const uint32_t last = std::min(offset + bytes - 1, kPhysicalMemorySize - 1) / kPageSize;
-    for (uint32_t page = offset / kPageSize; page <= last; ++page) g_page_generation[page] = generation;
+    for (uint32_t page = offset / kPageSize; page <= last; ++page) {
+        g_page_generation[page].store(generation, std::memory_order_relaxed);
+    }
 }
 
 }  // namespace
@@ -50,7 +59,7 @@ uint32_t refresh_physical_writes() {
         }
         for (ULONG_PTR i = 0; i < count; ++i) {
             const uint32_t offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(g_written_pages[i])) - kPhysicalMapBase;
-            g_page_generation[offset / kPageSize] = generation;
+            g_page_generation[offset / kPageSize].store(generation, std::memory_order_relaxed);
         }
         if (count < g_written_pages.size()) break;
     }
@@ -61,10 +70,9 @@ uint32_t physical_write_generation(uint32_t physical_address, uint32_t bytes) {
     physical_address &= 0x7FFFFFFF;
     if (!bytes || physical_address >= kPhysicalMemorySize) return 0;
     const uint32_t last = std::min(physical_address + bytes - 1, kPhysicalMemorySize - 1) / kPageSize;
-    std::lock_guard<std::mutex> lock(g_write_mutex);
     uint32_t latest = 0;
     for (uint32_t page = physical_address / kPageSize; page <= last; ++page) {
-        latest = std::max(latest, g_page_generation[page]);
+        latest = std::max(latest, g_page_generation[page].load(std::memory_order_relaxed));
     }
     return latest;
 }

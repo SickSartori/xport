@@ -603,12 +603,29 @@ std::unordered_map<uint64_t, ComPtr<ID3D11PixelShader>> g_pixel_shaders;
 std::map<TextureKey, CachedTexture> g_textures;
 uint64_t g_texture_clock = 0;  // frames shown, for forgetting the textures no draw asks for any more
 
+// What find_texture_view answered for the textures last asked for, by descriptor: a draw's textures are nearly always
+// among those of the draws before. While the game has not written the texture's memory since it was last checked
+// (the same test find_texture_view makes first) the answer stands: asking again was two table lookups, a search in
+// the map of textures and the texture's size worked out again, for every stage of every draw. Not for a texture still
+// being enlarged (its entry is polled), nor once a render target or a depth copy has been made since (the address
+// may now be one: they are only ever added). forget_unused_textures drops these with the entries.
+struct ViewMemo {
+    CachedTexture* cached = nullptr;
+    TextureDescriptor descriptor{};
+    bool flat = false;
+    uint32_t bytes = 0, palette = 0;  // what find_texture_view checks for writes
+    uint32_t generation = 0;          // g_write_generation when the answer was last confirmed
+    size_t targets = 0, depth_colours = 0;
+};
+ViewMemo g_view_memo[512];
+
 // Every 10 s of frames: the textures unused for a minute are forgotten (the game reuses its memory for new ones, and
 // each kept its GPU copy for ever). Called while presenting, when no CachedTexture& is held and the bound state is
 // forgotten anyway (ForgetBound).
 void forget_unused_textures() {
     constexpr uint64_t kSweepFrames = 600, kUnusedFrames = 3600;
     if (++g_texture_clock % kSweepFrames) return;
+    for (ViewMemo& memo : g_view_memo) memo = ViewMemo{};
     for (auto it = g_textures.begin(); it != g_textures.end();) {
         it = g_texture_clock - it->second.last_used > kUnusedFrames ? g_textures.erase(it) : std::next(it);
     }
@@ -843,6 +860,12 @@ struct BoundState {
     ID3D11ShaderResourceView* views[4] = {};
     ID3D11SamplerState* samplers[4] = {};
     ID3D11PixelShader* shader = nullptr;
+    // What draw_vertex_data set after it (the vertex shader, its constants and vertex bytes, the index buffer).
+    bool vertex_data = false;
+    ID3D11VertexShader* vertex_shader = nullptr;
+    ID3D11Buffer* vertex_constants = nullptr;
+    ID3D11ShaderResourceView* vertex_view = nullptr;
+    ID3D11Buffer* index_buffer = nullptr;
 };
 BoundState g_bound;
 struct ForgetBound {
@@ -1433,6 +1456,7 @@ ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
     const uint32_t palette = texture_is_paletted(d) ? d.palette : 0;
     const TextureKey key = std::make_tuple(d.address, d.format, d.pitch, d.rect, palette, enlarge);
     CachedTexture& cached = g_textures[key];
+    memo.cached = &cached, memo.bytes = bytes, memo.palette = palette;
     // On the way out: the entry may be rebuilt (cached = CachedTexture{}) on the way.
     struct Touch {
         CachedTexture& cached;
@@ -1607,6 +1631,36 @@ ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
         g_enlarger.request(key, hash, image, !enlarge_2d, lower_levels);
     }
     return cached.srv.Get();
+}
+
+ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
+    static const bool always_hash = GetEnvironmentVariableA(XPORT_ENV("ALWAYS_HASH"), nullptr, 0) != 0;
+    const TextureDescriptor& d = stage.descriptor;
+    ViewMemo& memo = g_view_memo[((d.address >> 4) * 0x9E3779B1u ^ d.format ^ (flat ? 1u : 0u)) >> 23];
+    if (memo.cached && memo.flat == flat && memo.targets == g_targets.size() &&
+        memo.depth_colours == g_depth_colours.size() && !memo.cached->waiting && memo.cached->srv &&
+        memo.descriptor.address == d.address && memo.descriptor.format == d.format &&
+        memo.descriptor.pitch == d.pitch && memo.descriptor.rect == d.rect &&
+        (!memo.palette || memo.palette == d.palette)) {  // the palette only where the format reads it
+        bool unwritten = memo.generation == g_write_generation;
+        if (!unwritten) {
+            uint32_t written = physical_write_generation(d.address, memo.bytes);
+            if (memo.palette) written = std::max(written, physical_write_generation(memo.palette, 1024));
+            unwritten = written <= memo.cached->checked_generation;
+        }
+        if (unwritten) {
+            memo.generation = g_write_generation;
+            memo.cached->last_used = g_texture_clock;
+            return memo.cached->srv.Get();
+        }
+    }
+    memo = ViewMemo{};
+    ID3D11ShaderResourceView* view = find_texture_view(stage, flat, memo);
+    const bool keep = view && memo.cached && view == memo.cached->srv.Get() && !always_hash;
+    if (!keep) memo.cached = nullptr;
+    memo.descriptor = d, memo.flat = flat, memo.generation = g_write_generation;
+    memo.targets = g_targets.size(), memo.depth_colours = g_depth_colours.size();
+    return view;
 }
 
 // Named after the shader's text: any change of it is a new file.
@@ -2905,14 +2959,32 @@ void draw_vertex_data(const SurfaceState& surface, const DrawState& state, ID3D1
     bind_draw_state(surface, state, draw);
     mark = ticks();
     g_stats.part_ticks[3] += mark - uploaded_at;
-    ID3D11Buffer* buffers[2] = {buffer, g_fixed_function_draw_constants.Get()};
-    g_context->VSSetConstantBuffers(1, 2, buffers);
-    ID3D11ShaderResourceView* view = g_attribute_ring.view.Get();
-    g_context->VSSetShaderResources(0, 1, &view);
-    g_context->IASetInputLayout(nullptr);
-    g_context->IASetIndexBuffer(g_index_ring.buffer.Get(), DXGI_FORMAT_R32_UINT, 0);
-    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g_context->VSSetShader(shader, nullptr, 0);
+    // Six calls that say the same from one draw to the next: only what differs is set, as bind_draw_state does.
+    BoundState& bound = g_bound;
+    if (!bound.vertex_data) {
+        g_context->IASetInputLayout(nullptr);
+        g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        bound.vertex_shader = nullptr, bound.vertex_constants = nullptr, bound.vertex_view = nullptr;
+        bound.index_buffer = nullptr;
+        bound.vertex_data = true;
+    }
+    if (buffer != bound.vertex_constants) {
+        ID3D11Buffer* buffers[2] = {buffer, g_fixed_function_draw_constants.Get()};
+        g_context->VSSetConstantBuffers(1, 2, buffers);
+        bound.vertex_constants = buffer;
+    }
+    if (ID3D11ShaderResourceView* view = g_attribute_ring.view.Get(); view != bound.vertex_view) {
+        g_context->VSSetShaderResources(0, 1, &view);
+        bound.vertex_view = view;
+    }
+    if (ID3D11Buffer* index_buffer = g_index_ring.buffer.Get(); index_buffer != bound.index_buffer) {
+        g_context->IASetIndexBuffer(index_buffer, DXGI_FORMAT_R32_UINT, 0);
+        bound.index_buffer = index_buffer;
+    }
+    if (shader != bound.vertex_shader) {
+        g_context->VSSetShader(shader, nullptr, 0);
+        bound.vertex_shader = shader;
+    }
     g_context->DrawIndexed(static_cast<UINT>(indices.size()), index_offset / 4, 0);
     const uint64_t end = ticks();
     g_stats.part_ticks[4] += end - mark;
@@ -3048,6 +3120,7 @@ void renderer_draw(const SurfaceState& surface, const DrawState& state, const st
     g_vertex_used += bytes;
     part(1);
     bind_draw_state(surface, state, draw);
+    g_bound.vertex_data = false;  // this draw's own vertex buffer, layout and shader, below
     part(3);
 
     const UINT stride = sizeof(RenderVertex), offset = 0;
