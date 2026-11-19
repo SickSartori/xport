@@ -113,6 +113,22 @@ void renderer_clear(const SurfaceState& surface, uint32_t flags, uint32_t color,
 void renderer_draw(const SurfaceState& surface, const DrawState& state, const std::vector<RenderVertex>& triangles);
 // Whether a draw on `surface` comes after the 3D scene on a frame that is shown (where the HUD is drawn).
 bool renderer_over_shown_scene(const SurfaceState& surface);
+
+// Draws and clears are done by a render thread, in the order they were asked for (renderer_d3d11.cpp, "the render
+// thread"); setting render_thread 0 keeps them on the calling thread. For whoever feeds the renderer:
+// - renderer_progress(value): how far the game's commands have been read; the next draw or clear asked for carries it,
+//   and when the render thread has done that one it calls the function given to renderer_set_progress with it.
+// - renderer_idle(): nothing is waiting to be drawn (the caller may then publish its progress itself).
+// - renderer_mark(): queues nothing but the progress.
+// - renderer_flush(): waits until everything asked for is drawn. The other functions of this file do it themselves.
+// - renderer_after_drawing(call, first, second): calls it when everything asked for so far is drawn, without waiting:
+//   at once if nothing is waiting, else from the render thread in its turn (a fence the game reads from memory).
+void renderer_set_progress(void (*publish)(uint32_t));
+void renderer_progress(uint32_t value);
+bool renderer_idle();
+void renderer_mark();
+void renderer_flush();
+void renderer_after_drawing(void (*call)(uint32_t, uint32_t), uint32_t first, uint32_t second);
 // Whether renderer_draw_fixed_function is available (shader compiled, buffers usable).
 bool renderer_has_fixed_function();
 // A PNG or JPEG as BGRA, on any thread (the launcher's logo too).

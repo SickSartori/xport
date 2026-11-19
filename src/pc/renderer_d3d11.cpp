@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <immintrin.h>
+#include <type_traits>
 #include <cmath>
 #include <condition_variable>
 #include <future>
@@ -34,6 +36,9 @@
 #include "pc/paths.h"
 #include "pc/physical_memory.h"
 #include "pc/profile.h"
+#include "pc/xbox_thread.h"
+
+#pragma comment(lib, "synchronization.lib")  // WaitOnAddress
 #include "pc/settings.h"
 #include "pc/texture_page_hash.h"
 #include "pc/texture_upscale.h"
@@ -667,6 +672,17 @@ double milliseconds(uint64_t t) {
     return t * 1000.0 / frequency;
 }
 
+uint64_t g_total_draws = 0;
+bool g_queue_alternates = false;  // setting render_thread 2
+bool g_queue_on = false;  // draws and clears go to the render thread (see "the render thread" below)
+// For the log: how often and how long the GPU thread waited for the render thread, to draw what was queued (flushes)
+// and for room in the queue.
+struct QueueWaits {
+    uint32_t flushes = 0, waited_flushes = 0;
+    uint64_t flush_ticks = 0, full_ticks = 0;
+};
+QueueWaits g_queue_waits;
+
 void log_statistics() {
     const ULONGLONG now = GetTickCount64();
     if (!g_stats_since) g_stats_since = now;
@@ -685,6 +701,13 @@ void log_statistics() {
              milliseconds(g_stats.part_ticks[2] + g_stats.part_ticks[3]) / seconds,
              milliseconds(g_stats.part_ticks[4]) / seconds, milliseconds(g_stats.swap_ticks) / seconds,
              static_cast<unsigned long long>(g_stats.shader_waits));
+    if (g_queue_on) {
+        log_line("renderer: render thread: the GPU thread waited %.0f ms a second for it in %.0f of %.0f flushes, %.0f ms for "
+                 "room in the queue",
+                 milliseconds(g_queue_waits.flush_ticks) / seconds, g_queue_waits.waited_flushes / seconds,
+                 g_queue_waits.flushes / seconds, milliseconds(g_queue_waits.full_ticks) / seconds);
+        g_queue_waits = {};
+    }
     g_stats = {};
     g_stats_since = now;
 }
@@ -1008,6 +1031,15 @@ struct SceneState {
 };
 std::unordered_map<uint32_t, SceneState> g_scenes;
 uint32_t g_occlusion_scenes = 0, g_full_depth_clears = 0;  // for the log: every scene should get its pass
+
+// The render thread (see "the render thread" below): draws and clears are queued by the thread that decodes the game's commands and
+// done by another. What the decoding thread asks about the scene (renderer_over_shown_scene) is answered from what it
+// has queued, not from what is drawn so far.
+DWORD g_render_thread_id = 0;
+std::unordered_map<uint32_t, bool> g_queued_scenes;     // by depth buffer: a scene draw queued since its last clear
+std::unordered_map<uint32_t, uint32_t> g_queued_widths;  // by colour buffer: the widest surface asked for
+void start_render_thread();
+void flush_queue();  // waits until everything queued is drawn; nothing to do on the render thread itself
 
 bool g_frame_scene = false;  // a draw in perspective since the last present (renderer_note_scene): not a film or loading screen
 float g_shown_aspect = 0;    // the shape the last frame was shown in (renderer_aspect, 16:9 at most without 3D)
@@ -2432,6 +2464,7 @@ bool renderer_start(HWND window) {
     factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);  // full screen is the window's own (nv2a.cpp)
     g_window_handle = window;
     if (g_present_threaded) std::thread(present_thread).detach();
+    start_render_thread();
     preload_shaders();
 
     ComPtr<ID3DBlob> vs = compile(kVertexShader, sizeof(kVertexShader) - 1, "vs_5_0", "vertex");
@@ -2602,12 +2635,17 @@ bool renderer_start(HWND window) {
 }
 
 bool renderer_over_shown_scene(const SurfaceState& surface) {
+    if (g_render_thread_id && GetCurrentThreadId() != g_render_thread_id) {
+        const auto queued = g_queued_scenes.find(surface.zeta_address);
+        return queued != g_queued_scenes.end() && queued->second && g_shown_surfaces.count(surface.color_address) != 0;
+    }
     const auto scene = g_scenes.find(surface.zeta_address);
     return scene != g_scenes.end() && scene->second.drawn && g_shown_surfaces.count(surface.color_address) != 0;
 }
 
-void renderer_clear(const SurfaceState& surface, uint32_t flags, uint32_t color, uint32_t depth_stencil, int x0, int y0,
-                    int x1, int y1) {
+namespace {
+void clear_now(const SurfaceState& surface, uint32_t flags, uint32_t color, uint32_t depth_stencil, int x0, int y0, int x1,
+               int y1) {
     if (!g_device || !surface.width || !surface.height) return;
     Target* target = get_target(surface.color_address, surface.width, surface.height);
     if (!target) return;
@@ -2672,6 +2710,7 @@ void renderer_clear(const SurfaceState& surface, uint32_t flags, uint32_t color,
         }
     }
 }
+}  // namespace
 
 namespace {
 
@@ -2688,6 +2727,7 @@ bool prepare_draw(const SurfaceState& surface, const DrawState& state, PreparedD
     // Culling both faces draws nothing.
     if (state.cull_enable && state.cull_face == 0x408) return false;
     ++g_stats.draws;
+    ++g_total_draws;
     Target* target = get_target(surface.color_address, surface.width, surface.height);
     if (!target) return false;
     if (state.blend_enable && (state.blend_equation == 0xF005 || state.blend_equation == 0xF006)) {
@@ -2978,8 +3018,8 @@ bool g_program_valid = false;
 template <typename Constants>
 void draw_vertex_data(const SurfaceState& surface, const DrawState& state, ID3D11VertexShader* shader,
                       ID3D11Buffer* buffer, const Constants& constants, Constants& uploaded, bool& valid,
-                      const void* vertex_data, uint32_t vertex_bytes, const std::vector<uint32_t>& indices) {
-    if (indices.empty() || !shader) return;
+                      const void* vertex_data, uint32_t vertex_bytes, const uint32_t* indices, uint32_t index_count) {
+    if (!index_count || !shader) return;
     const uint64_t draw_start = ticks();
     PreparedDraw draw;
     if (!prepare_draw(surface, state, draw)) return;
@@ -2990,7 +3030,7 @@ void draw_vertex_data(const SurfaceState& surface, const DrawState& state, ID3D1
         first = ring_append(g_attribute_ring, vertex_data, vertex_bytes, D3D11_BIND_SHADER_RESOURCE, 4);
         if (first == ~0u) return;
     }
-    const uint32_t index_offset = ring_append(g_index_ring, indices.data(), static_cast<uint32_t>(indices.size() * 4),
+    const uint32_t index_offset = ring_append(g_index_ring, indices, index_count * 4,
                                               D3D11_BIND_INDEX_BUFFER, 4);
     if (index_offset == ~0u) return;
     // The transform state changes far less often than draws: uploaded only when different.
@@ -3032,7 +3072,7 @@ void draw_vertex_data(const SurfaceState& surface, const DrawState& state, ID3D1
         g_context->VSSetShader(shader, nullptr, 0);
         bound.vertex_shader = shader;
     }
-    g_context->DrawIndexed(static_cast<UINT>(indices.size()), index_offset / 4, 0);
+    g_context->DrawIndexed(index_count, index_offset / 4, 0);
     const uint64_t end = ticks();
     g_stats.part_ticks[4] += end - mark;
     g_stats.draw_ticks += end - draw_start;
@@ -3046,11 +3086,322 @@ bool renderer_load_picture(const std::filesystem::path& file, std::vector<uint8_
 
 bool renderer_has_fixed_function() { return g_fixed_function_vertex_shader != nullptr; }
 
+namespace {
+
+// --- the render thread ---
+//
+// One thread decoded the game's drawing commands and made Direct3D's calls for them, and it is the port's limit: at
+// 120 fps, and in split screen. The two halves are now two threads. The thread that decodes (the GPU thread) copies
+// each draw (state, constants, vertex bytes, indices) and each clear into a queue; the render thread takes them in
+// order and does what the first did: finds the textures, binds the state, draws.
+//
+// Everything else the renderer does (presenting, blits, the rare draw with CPU vertices, debugging reads) happens on
+// the calling thread once the queue is empty (flush_queue), so that the two never touch Direct3D or the renderer's
+// tables at the same time, and no lock is needed around them.
+//
+// The game learns how far the GPU has come from the push buffer's GET and from the methods that answer it (reference,
+// semaphore, flip, traps): it changes a texture or reuses memory only after the draws that use them. So the port
+// publishes GET as the render thread finishes (renderer_progress, the value each queued command carries), and waits
+// for the queue before those methods (renderer_flush): for the game the GPU is as far as what is really drawn.
+//
+// The queue is a ring of bytes written by one thread and read by one: records of whole 16 bytes, never split across
+// the end (a skip record fills what is left). Setting render_thread 0 turns it off: everything on the GPU thread again.
+enum class Queued : uint32_t { kSkip, kMark, kCall, kClear, kFixedFunction, kProgram };
+
+struct QueuedHeader {
+    uint32_t bytes;  // of the whole record
+    Queued kind;
+    uint32_t progress;
+    uint32_t has_progress;
+};
+
+struct QueuedCall {
+    void (*call)(uint32_t, uint32_t);
+    uint32_t first, second;
+};
+
+struct QueuedClear {
+    SurfaceState surface;
+    uint32_t flags, color, depth_stencil;
+    int x0, y0, x1, y1;
+};
+
+template <typename Constants>
+struct QueuedDraw {
+    Constants constants;  // first: aligned to 16 bytes like the record
+    SurfaceState surface;
+    DrawState state;
+    uint64_t key;  // the vertex program's (kProgram)
+    uint32_t vertex_bytes, index_count;
+};
+
+// A power of two, small enough to stay in the processor's cache: the two threads go round the same few megabytes.
+// At 64 MB every draw was written to and read from memory neither had in its cache.
+constexpr uint32_t kQueueBytes = 4u << 20;
+uint8_t* g_queue = nullptr;
+std::atomic<uint32_t> g_queue_head{0}, g_queue_tail{0};  // bytes written and read, counted without wrapping
+std::atomic<bool> g_render_waiting{false}, g_front_waiting{false};
+void (*g_publish_progress)(uint32_t) = nullptr;
+uint32_t g_progress = 0;
+bool g_has_progress = false;
+
+void wait_for_change(std::atomic<uint32_t>& value, uint32_t seen, std::atomic<bool>& waiting) {
+    for (int spin = 0; spin < 4000; ++spin) {  // the other thread is nearly always about to move it
+        if (value.load(std::memory_order_acquire) != seen) return;
+        _mm_pause();
+    }
+    waiting.store(true);
+    if (value.load() == seen) WaitOnAddress(&value, &seen, sizeof(seen), 1);  // 1 ms: a lost wake costs no more
+    waiting.store(false);
+}
+
+// Room for a record of `bytes` (whole 16s), in one piece: where to write it.
+uint8_t* reserve_queued(uint32_t bytes) {
+    for (;;) {
+        const uint32_t head = g_queue_head.load(std::memory_order_relaxed);
+        const uint32_t tail = g_queue_tail.load(std::memory_order_acquire);
+        const uint32_t at = head & (kQueueBytes - 1), to_end = kQueueBytes - at;
+        const uint32_t needed = to_end < bytes ? to_end + bytes : bytes;
+        if (kQueueBytes - (head - tail) < needed) {
+            const uint64_t start = ticks();
+            wait_for_change(g_queue_tail, tail, g_front_waiting);
+            g_queue_waits.full_ticks += ticks() - start;
+            continue;
+        }
+        if (to_end < bytes) {
+            *reinterpret_cast<QueuedHeader*>(g_queue + at) = {to_end, Queued::kSkip, 0, 0};
+            g_queue_head.store(head + to_end, std::memory_order_release);
+            continue;
+        }
+        return g_queue + at;
+    }
+}
+
+void commit_queued(uint8_t* record, uint32_t bytes, Queued kind) {
+    *reinterpret_cast<QueuedHeader*>(record) = {bytes, kind, g_progress, g_has_progress ? 1u : 0u};
+    g_has_progress = false;
+    g_queue_head.store(g_queue_head.load(std::memory_order_relaxed) + bytes, std::memory_order_release);
+    if (g_render_waiting.load()) WakeByAddressSingle(&g_queue_head);
+}
+
+void note_queued_draw(const SurfaceState& surface, const DrawState& state) {
+    if (state.cull_enable && state.cull_face == 0x408) return;  // as prepare_draw: nothing is drawn
+    uint32_t& width = g_queued_widths[surface.color_address];
+    width = std::max(width, surface.width);
+    constexpr uint32_t kDepthAlways = 0x207;
+    const bool scene_draw = (state.depth_test && state.depth_function != kDepthAlways) || state.depth_write;
+    if (scene_draw && surface.zeta_address && width >= 640) g_queued_scenes[surface.zeta_address] = true;
+}
+
+template <typename Constants>
+bool queue_draw(Queued kind, const SurfaceState& surface, const DrawState& state, uint64_t key,
+                const Constants& constants, const void* vertex_data, uint32_t vertex_bytes,
+                const std::vector<uint32_t>& indices) {
+    const uint32_t vertex_room = (vertex_bytes + 3) & ~3u;
+    const uint64_t bytes64 = (sizeof(QueuedHeader) + sizeof(QueuedDraw<Constants>) + uint64_t{vertex_room} +
+                              indices.size() * 4 + 15) & ~uint64_t{15};
+    if (bytes64 > kQueueBytes / 4) return false;  // a huge draw: done in its turn by the caller, not queued
+    const uint32_t bytes = static_cast<uint32_t>(bytes64);
+    uint8_t* record = reserve_queued(bytes);
+    auto* draw = reinterpret_cast<QueuedDraw<Constants>*>(record + sizeof(QueuedHeader));
+    std::memcpy(&draw->constants, &constants, sizeof(constants));
+    draw->surface = surface;
+    draw->state = state;
+    draw->key = key;
+    draw->vertex_bytes = vertex_bytes;
+    draw->index_count = static_cast<uint32_t>(indices.size());
+    uint8_t* data = reinterpret_cast<uint8_t*>(draw + 1);
+    if (vertex_bytes) std::memcpy(data, vertex_data, vertex_bytes);
+    std::memcpy(data + vertex_room, indices.data(), indices.size() * 4);
+    note_queued_draw(surface, state);
+    commit_queued(record, bytes, kind);
+    return true;
+}
+
+void draw_fixed_function_now(const SurfaceState& surface, const DrawState& state, const FixedFunctionConstants& constants,
+                             const void* vertex_data, uint32_t vertex_bytes, const uint32_t* indices,
+                             uint32_t index_count) {
+    draw_vertex_data(surface, state, g_fixed_function_vertex_shader.Get(), g_fixed_function_constants.Get(), constants,
+                     g_fixed_function_uploaded, g_fixed_function_valid, vertex_data, vertex_bytes, indices, index_count);
+}
+
+void draw_program_now(const SurfaceState& surface, const DrawState& state, uint64_t key, const ProgramConstants& constants,
+                      const void* vertex_data, uint32_t vertex_bytes, const uint32_t* indices, uint32_t index_count) {
+    ID3D11VertexShader* shader = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_program_mutex);
+        const auto found = g_program_shaders.find(key);
+        if (found != g_program_shaders.end()) shader = found->second.shader.Get();
+    }
+    draw_vertex_data(surface, state, shader, g_program_constants.Get(), constants, g_program_uploaded, g_program_valid,
+                     vertex_data, vertex_bytes, indices, index_count);
+}
+
+template <typename Constants>
+void run_queued_draw(const QueuedHeader* header) {
+    const auto* draw = reinterpret_cast<const QueuedDraw<Constants>*>(header + 1);
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(draw + 1);
+    const auto* indices = reinterpret_cast<const uint32_t*>(data + ((draw->vertex_bytes + 3) & ~3u));
+    if constexpr (std::is_same_v<Constants, ProgramConstants>) {
+        draw_program_now(draw->surface, draw->state, draw->key, draw->constants, data, draw->vertex_bytes, indices,
+                         draw->index_count);
+    } else {
+        draw_fixed_function_now(draw->surface, draw->state, draw->constants, data, draw->vertex_bytes, indices,
+                                draw->index_count);
+    }
+}
+
+void render_thread() {
+    if (const unsigned long cores = gpu_cores()) SetThreadAffinityMask(GetCurrentThread(), cores);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    profile_name_thread(false, "render");
+    g_render_thread_id = GetCurrentThreadId();
+    for (;;) {
+        const uint32_t tail = g_queue_tail.load(std::memory_order_relaxed);
+        if (g_queue_head.load(std::memory_order_acquire) == tail) {
+            ProfileScope scope(ProfileTime::idle);
+            wait_for_change(g_queue_head, tail, g_render_waiting);
+            continue;
+        }
+        const auto* header = reinterpret_cast<const QueuedHeader*>(g_queue + (tail & (kQueueBytes - 1)));
+        switch (header->kind) {
+            case Queued::kClear: {
+                const auto* clear = reinterpret_cast<const QueuedClear*>(header + 1);
+                clear_now(clear->surface, clear->flags, clear->color, clear->depth_stencil, clear->x0, clear->y0,
+                          clear->x1, clear->y1);
+                break;
+            }
+            case Queued::kFixedFunction: run_queued_draw<FixedFunctionConstants>(header); break;
+            case Queued::kProgram: run_queued_draw<ProgramConstants>(header); break;
+            case Queued::kCall: {
+                const auto* call = reinterpret_cast<const QueuedCall*>(header + 1);
+                call->call(call->first, call->second);
+                break;
+            }
+            default: break;  // kSkip, kMark
+        }
+        if (header->has_progress && g_publish_progress) g_publish_progress(header->progress);
+        g_queue_tail.store(tail + header->bytes, std::memory_order_release);
+        if (g_front_waiting.load()) WakeByAddressAll(&g_queue_tail);
+    }
+}
+
+void flush_queue() {
+    if (!g_queue_on || GetCurrentThreadId() == g_render_thread_id) return;
+    const uint32_t head = g_queue_head.load(std::memory_order_relaxed);
+    ++g_queue_waits.flushes;
+    if (g_queue_tail.load(std::memory_order_acquire) != head) {
+        ++g_queue_waits.waited_flushes;
+        const uint64_t start = ticks();
+        for (;;) {
+            const uint32_t tail = g_queue_tail.load(std::memory_order_acquire);
+            if (tail == head) break;
+            wait_for_change(g_queue_tail, tail, g_front_waiting);
+        }
+        g_queue_waits.flush_ticks += ticks() - start;
+    }
+    // Progress noted while draws were queued, with no command after it to carry it: the caller is about to wait for
+    // the game, which may itself be waiting for that progress.
+    if (g_has_progress) {
+        g_has_progress = false;
+        if (g_publish_progress) g_publish_progress(g_progress);
+    }
+}
+
+void start_render_thread() {
+    // Setting render_thread: 1 = on (the default), 0 = everything on the GPU thread as before, 2 = taking turns (see
+    // renderer_present). With fewer than three processors beside the game's the two threads would share one.
+    const float wanted = setting_at_start("render_thread");
+    unsigned long cores = emulation_cores(), count = 0;
+    for (; cores; cores &= cores - 1) ++count;
+    if (!emulation_cores()) count = std::thread::hardware_concurrency();  // the game is not kept on one core
+    if (wanted == 0 || count < 3) {
+        log_line("renderer: no render thread (%s), draws on the GPU thread",
+                 wanted == 0 ? "setting render_thread 0" : "too few processors");
+        return;
+    }
+    g_queue = static_cast<uint8_t*>(VirtualAlloc(nullptr, kQueueBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!g_queue) {
+        log_line("renderer: no memory for the draw queue, draws on the GPU thread");
+        return;
+    }
+    g_queue_alternates = wanted == 2;
+    std::thread(render_thread).detach();
+    while (!g_render_thread_id) Sleep(0);
+    g_queue_on = true;
+    log_line("renderer: draws and clears on a render thread");
+}
+
+}  // namespace
+
+void renderer_set_progress(void (*publish)(uint32_t)) { g_publish_progress = publish; }
+
+bool renderer_idle() {
+    return !g_queue_on || g_queue_tail.load(std::memory_order_acquire) == g_queue_head.load(std::memory_order_relaxed);
+}
+
+// With nothing queued the progress is published at once; else the next command queued carries the latest value (one
+// kept back and then published by a later command would take the game's view of the GPU backwards).
+void renderer_progress(uint32_t value) {
+    if (renderer_idle()) {
+        g_has_progress = false;
+        if (g_publish_progress) g_publish_progress(value);
+    } else {
+        g_progress = value, g_has_progress = true;
+    }
+}
+
+void renderer_mark() {
+    if (!g_has_progress) return;
+    if (renderer_idle()) return renderer_progress(g_progress);
+    uint8_t* record = reserve_queued(sizeof(QueuedHeader));
+    commit_queued(record, sizeof(QueuedHeader), Queued::kMark);
+}
+
+void renderer_flush() { flush_queue(); }
+
+void renderer_after_drawing(void (*call)(uint32_t, uint32_t), uint32_t first, uint32_t second) {
+    if (renderer_idle()) return call(first, second);
+    constexpr uint32_t kBytes = (sizeof(QueuedHeader) + sizeof(QueuedCall) + 15) & ~15u;
+    uint8_t* record = reserve_queued(kBytes);
+    *reinterpret_cast<QueuedCall*>(record + sizeof(QueuedHeader)) = {call, first, second};
+    commit_queued(record, kBytes, Queued::kCall);
+}
+
+void renderer_clear(const SurfaceState& surface, uint32_t flags, uint32_t color, uint32_t depth_stencil, int x0, int y0,
+                    int x1, int y1) {
+    if ((flags & 0x1) && surface.zeta_address && surface.width >= 640) g_queued_scenes[surface.zeta_address] = false;
+    if (!g_queue_on) return clear_now(surface, flags, color, depth_stencil, x0, y0, x1, y1);
+    constexpr uint32_t kBytes = (sizeof(QueuedHeader) + sizeof(QueuedClear) + 15) & ~15u;
+    uint8_t* record = reserve_queued(kBytes);
+    *reinterpret_cast<QueuedClear*>(record + sizeof(QueuedHeader)) = {surface, flags, color, depth_stencil, x0, y0, x1, y1};
+    commit_queued(record, kBytes, Queued::kClear);
+}
+
 void renderer_draw_fixed_function(const SurfaceState& surface, const DrawState& state,
                                   const FixedFunctionConstants& constants, const void* vertex_data,
                                   uint32_t vertex_bytes, const std::vector<uint32_t>& indices) {
-    draw_vertex_data(surface, state, g_fixed_function_vertex_shader.Get(), g_fixed_function_constants.Get(), constants,
-                     g_fixed_function_uploaded, g_fixed_function_valid, vertex_data, vertex_bytes, indices);
+    if (indices.empty()) return;
+    if (g_queue_on && queue_draw(Queued::kFixedFunction, surface, state, 0, constants, vertex_data, vertex_bytes, indices)) {
+        return;
+    }
+    flush_queue();
+    if (g_render_thread_id) note_queued_draw(surface, state);
+    draw_fixed_function_now(surface, state, constants, vertex_data, vertex_bytes, indices.data(),
+                            static_cast<uint32_t>(indices.size()));
+}
+
+void renderer_draw_program(const SurfaceState& surface, const DrawState& state, uint64_t key,
+                           const ProgramConstants& constants, const void* vertex_data, uint32_t vertex_bytes,
+                           const std::vector<uint32_t>& indices) {
+    if (indices.empty()) return;
+    if (g_queue_on && queue_draw(Queued::kProgram, surface, state, key, constants, vertex_data, vertex_bytes, indices)) {
+        return;
+    }
+    flush_queue();
+    if (g_render_thread_id) note_queued_draw(surface, state);
+    draw_program_now(surface, state, key, constants, vertex_data, vertex_bytes, indices.data(),
+                     static_cast<uint32_t>(indices.size()));
 }
 
 bool renderer_prepare_program(uint64_t key, const std::function<std::string()>& source) {
@@ -3103,21 +3454,9 @@ bool renderer_prepare_program(uint64_t key, const std::function<std::string()>& 
     return false;
 }
 
-void renderer_draw_program(const SurfaceState& surface, const DrawState& state, uint64_t key,
-                           const ProgramConstants& constants, const void* vertex_data, uint32_t vertex_bytes,
-                           const std::vector<uint32_t>& indices) {
-    ID3D11VertexShader* shader = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_program_mutex);
-        const auto found = g_program_shaders.find(key);
-        if (found != g_program_shaders.end()) shader = found->second.shader.Get();
-    }
-    draw_vertex_data(surface, state, shader, g_program_constants.Get(), constants, g_program_uploaded, g_program_valid,
-                     vertex_data, vertex_bytes, indices);
-}
-
 void renderer_draw(const SurfaceState& surface, const DrawState& state, const std::vector<RenderVertex>& triangles) {
     if (triangles.empty()) return;
+    flush_queue();  // a draw with its vertices worked out on the CPU: rare, done here in its turn
     const uint64_t draw_start = ticks();
     struct Account {
         uint64_t start;
@@ -3181,11 +3520,13 @@ void renderer_draw(const SurfaceState& surface, const DrawState& state, const st
 }
 
 void renderer_dump_target(uint32_t address, const char* prefix) {
+    flush_queue();
     const auto found = g_targets.find(address);
     if (found != g_targets.end()) dump_frame(found->second.texture.Get(), prefix);
 }
 
 bool renderer_probe(uint32_t address, uint32_t x, uint32_t y, uint8_t bgra[4]) {
+    flush_queue();
     const auto found = g_targets.find(address);
     if (found == g_targets.end() || x >= found->second.width || y >= found->second.height) return false;
     static ComPtr<ID3D11Texture2D> staging;
@@ -3218,6 +3559,7 @@ void renderer_note_vertex_work(uint64_t elapsed, uint32_t vertices) {
 
 void renderer_blit(const BlitRequest& b) {
     if (!g_device || !b.width || !b.height) return;
+    flush_queue();  // it reads and writes the game's memory and the targets
     const auto source = g_targets.find(b.source);
     if (source != g_targets.end() && b.bytes_per_pixel == 4) {
         const Target& from = source->second;
@@ -3308,6 +3650,20 @@ void renderer_set_effects(bool on) {
 void renderer_set_overlay(RendererOverlay overlay) { g_overlay = overlay; }
 
 void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_t pitch) {
+    flush_queue();  // the frame is whole before it is shown
+    // Setting render_thread 2: the two ways take turns every 4 s, with the draws and frames of each in the log. On a PC
+    // whose speed swings from one run to the next it is the comparison that can be read: the same scene, the same moment.
+    if (g_queue_alternates) {
+        static ULONGLONG since = GetTickCount64();
+        static uint64_t draws_then = 0, frames = 0;
+        ++frames;
+        if (GetTickCount64() - since >= 4000) {
+            const double seconds = (GetTickCount64() - since) / 1000.0;
+            log_line("renderer: render thread %s: %.0f draws and %.1f frames a second", g_queue_on ? "on" : "off",
+                     (g_total_draws - draws_then) / seconds, frames / seconds);
+            g_queue_on = !g_queue_on, since = GetTickCount64(), draws_then = g_total_draws, frames = 0;
+        }
+    }
     const ForgetBound forget;  // presenting draws effects and the overlay (ImGui) with their own state
     if (!g_device || !width || !height) return;
     ID3D11Texture2D* frame = nullptr;
