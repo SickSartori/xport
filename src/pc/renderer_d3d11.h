@@ -152,9 +152,14 @@ void renderer_blit(const BlitRequest& blit);
 // Shows the surface at `address`; falls back to the guest memory there when nothing was rendered to it.
 void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_t pitch);
 
-// The shape the picture is shown in: 16:9 with the widescreen setting (the game then draws for a widescreen TV),
-// otherwise 4:3.
+// The shape the picture is shown in, by setting widescreen: 0 = 4:3; 1 = 16:9 (the game then draws for a widescreen
+// TV); 2 = the screen's own shape when it is wider (21:9, 32:9; the port then gives the game that shape), else 16:9.
+// Frames with no 3D scene (films, loading screens) are shown at 16:9 at most.
 float renderer_aspect();
+// Wider than 16:9 only: a draw with a vertex in perspective (w not 1) went into the frame since the last present
+// (the game's GPU front end tells, from the first vertex of its draws until one is).
+void renderer_note_scene();
+bool renderer_scene_noted();
 // Where the last frame shown is in the window (for the new HUD, drawn over it).
 // Where the last frame shown is in the window, without the overscan edges (MC3's new HUD is drawn over it).
 struct ShownPicture {

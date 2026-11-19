@@ -986,6 +986,8 @@ struct SceneState {
 std::unordered_map<uint32_t, SceneState> g_scenes;
 uint32_t g_occlusion_scenes = 0, g_full_depth_clears = 0;  // for the log: every scene should get its pass
 
+bool g_frame_scene = false;  // a draw in perspective since the last present (renderer_note_scene): not a film or loading screen
+float g_shown_aspect = 0;    // the shape the last frame was shown in (renderer_aspect, 16:9 at most without 3D)
 uint32_t g_picture_width = 0, g_picture_height = 0;  // the last frame shown
 ShownPicture g_shown_picture{};                       // and where it is in the window
 constexpr uint32_t kOverscan = 48;                    // 1 / kOverscan of each side is not shown
@@ -2026,7 +2028,7 @@ void present_frame(ID3D11ShaderResourceView* frame, uint32_t frame_width, uint32
     const ForgetBound forget;
     if (!g_final_rtv || !g_present_pixel_shader) return;
     if (g_effects_enabled && g_final_pixel_shader && frame_width && frame_height) {
-        const float aspect = renderer_aspect();
+        const float aspect = g_shown_aspect > 0 ? g_shown_aspect : renderer_aspect();
         float width = static_cast<float>(g_swap_width), height = static_cast<float>(g_swap_height);
         if (width > height * aspect) {
             width = height * aspect;
@@ -2064,7 +2066,7 @@ void present_frame(ID3D11ShaderResourceView* frame, uint32_t frame_width, uint32
         post_pass(g_final_rtv.Get(), area, g_final_pixel_shader.Get(), sources, 2, constants);
         return;
     }
-    const float aspect = renderer_aspect();
+    const float aspect = g_shown_aspect > 0 ? g_shown_aspect : renderer_aspect();
     float width = static_cast<float>(g_swap_width), height = static_cast<float>(g_swap_height);
     if (width > height * aspect) {
         width = height * aspect;
@@ -3142,7 +3144,31 @@ void renderer_blit(const BlitRequest& b) {
     }
 }
 
-float renderer_aspect() { return setting_at_start("widescreen") != 0 ? 16.0f / 9.0f : 4.0f / 3.0f; }
+float renderer_aspect() {
+    static const float aspect = [] {
+        const float widescreen = setting_at_start("widescreen");
+        if (widescreen == 0) return 4.0f / 3.0f;
+        float shape = 16.0f / 9.0f;
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        // shortcut: the primary screen's shape, read once; a game window on a wider second screen keeps it.
+        if (widescreen >= 2 && GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &info)) {
+            const float width = static_cast<float>(info.rcMonitor.right - info.rcMonitor.left);
+            const float height = static_cast<float>(info.rcMonitor.bottom - info.rcMonitor.top);
+            if (height > 0) shape = std::clamp(width / height, shape, 4.0f);
+        }
+        // <GAME>_SCREEN_SHAPE=<width/height>: that screen shape instead (testing 21:9 without such a screen).
+        if (const char* forced = std::getenv(XPORT_ENV("SCREEN_SHAPE")); forced && widescreen >= 2) {
+            shape = std::clamp(static_cast<float>(std::atof(forced)), 16.0f / 9.0f, 4.0f);
+        }
+        return shape;
+    }();
+    return aspect;
+}
+
+void renderer_note_scene() { g_frame_scene = true; }
+
+bool renderer_scene_noted() { return g_frame_scene; }
 
 ShownPicture renderer_shown_picture() { return g_shown_picture; }
 
@@ -3170,7 +3196,12 @@ void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_
     if (target != g_targets.end()) {
         g_shown_surfaces.insert(address);
         g_picture_width = width, g_picture_height = height;
-        const float aspect = renderer_aspect();
+        // A film or loading screen is made for 16:9 at most: wider screens show it with bars at the sides.
+        const float previous_aspect = g_shown_aspect;
+        g_shown_aspect = g_frame_scene ? renderer_aspect() : std::min(renderer_aspect(), 16.0f / 9.0f);
+        if (g_shown_aspect != previous_aspect) log_line("renderer: frames shown at %.3f", g_shown_aspect);
+        g_frame_scene = false;
+        const float aspect = g_shown_aspect;
         float window_width = static_cast<float>(g_swap_width), window_height = static_cast<float>(g_swap_height);
         if (window_width > window_height * aspect) {
             window_width = window_height * aspect;
