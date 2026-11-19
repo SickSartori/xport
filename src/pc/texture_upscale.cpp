@@ -275,6 +275,16 @@ bool read_image(const TextureImage& image, bool scene, Image& picture) {
 
 }  // namespace
 
+TextureImage texture_bgra(const TextureImage& image) {
+    Image picture;
+    if (!read_image(image, true, picture)) {
+        TextureImage none;
+        none.layout = TextureLayout::Unsupported;
+        return none;
+    }
+    return to_bgra(picture);
+}
+
 std::vector<TextureImage> upscale_texture(const TextureImage& image, bool scene, const std::vector<TextureImage>& lower) {
     if (image.width < 4 || image.height < 4) return {};
     const uint32_t largest = std::max(image.width, image.height);

@@ -1423,10 +1423,50 @@ bool make_replacement(const std::filesystem::path& file, CachedTexture& cached) 
     return true;
 }
 
+// <GAME>_DUMP_TEXTURE=all: every texture the game draws with, once, as textures_dump\<hash>.png in the data folder
+// (BGRA with its alpha, whatever the game's format): the pictures to redraw or enlarge with a tool of one's own, and
+// to put back in textures_replace under the same name.
+void dump_for_replacement(const TextureImage& image, uint64_t hash) {
+    static std::unordered_set<uint64_t> dumped;
+    if (!dumped.insert(hash).second) return;
+    const std::filesystem::path folder = data_directory() / "textures_dump";
+    std::error_code error;
+    std::filesystem::create_directories(folder, error);
+    wchar_t name[32];
+    std::swprintf(name, 32, L"%016llX.png", static_cast<unsigned long long>(hash));
+    const std::filesystem::path file = folder / name;
+    if (std::filesystem::exists(file, error)) return;
+    const TextureImage bgra = texture_bgra(image);
+    if (bgra.layout != TextureLayout::Bgra8) return;
+    thread_local const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    (void)com;
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    const bool saved =
+        SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(file.c_str(), GENERIC_WRITE)) &&
+        SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
+        SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
+        SUCCEEDED(frame->SetSize(bgra.width, bgra.height)) && SUCCEEDED(frame->SetPixelFormat(&format)) &&
+        IsEqualGUID(format, GUID_WICPixelFormat32bppBGRA) &&
+        SUCCEEDED(frame->WritePixels(bgra.height, bgra.row_pitch, static_cast<UINT>(bgra.data.size()),
+                                     const_cast<BYTE*>(bgra.data.data()))) &&
+        SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+    if (!saved) {
+        stream.Reset();
+        std::filesystem::remove(file, error);  // no half-written picture left to be taken for a replacement's source
+        log_line("renderer: could not save %s", file.string().c_str());
+    }
+}
+
 // `flat`: the draw is flat over the 3D scene (the HUD): with sharp_2d its textures are enlarged (texture_upscale.cpp),
 // and those the game names (renderer_game_enlarge); with sharp_textures those of the scene as well. Not the linear
 // ones, which are addressed in texels.
-ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
+ID3D11ShaderResourceView* find_texture_view(const TextureStage& stage, bool flat, ViewMemo& memo) {
     const TextureDescriptor& d = stage.descriptor;
     static const bool sharp_2d = setting_at_start("sharp_2d") != 0;
     static const bool sharp_textures = setting_at_start("sharp_textures") != 0;
@@ -1552,9 +1592,16 @@ ID3D11ShaderResourceView* texture_view(const TextureStage& stage, bool flat) {
     const bool game_drew = renderer_game_texture(d, memory, bytes, image);
     // <GAME>_DUMP_TEXTURE=<hex address>: save the textures in that 4 KB page once decoded (BGRA with alpha) as
     // texture-<address>-<hash>.bmp (resources move a little between runs; the hash names a replacement).
+    static const bool dump_all = [] {
+        char value[16] = {};
+        return GetEnvironmentVariableA(XPORT_ENV("DUMP_TEXTURE"), value, sizeof(value)) && std::strcmp(value, "all") == 0;
+    }();
+    if (dump_all && !texture_is_linear(d) && !game_drew) dump_for_replacement(image, own_hash);
     static const uint32_t dump_texture = [] {
         char value[16] = {};
-        return GetEnvironmentVariableA(XPORT_ENV("DUMP_TEXTURE"), value, sizeof(value)) ? std::strtoul(value, nullptr, 16) : 0u;
+        return !dump_all && GetEnvironmentVariableA(XPORT_ENV("DUMP_TEXTURE"), value, sizeof(value))
+                   ? std::strtoul(value, nullptr, 16)
+                   : 0u;
     }();
     // <GAME>_DUMP_2D=1: also every texture of the HUD's flat draws (those sharp_2d enlarges). Block-compressed ones as
     // they are, in a DDS file (texture-<address>-<hash>.dds).

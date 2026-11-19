@@ -16,6 +16,9 @@ namespace xport::pc {
 // enlarged less than the HUD's; `lower` are the game's own lower levels, kept below the enlarged ones.
 std::vector<TextureImage> upscale_texture(const TextureImage& image, bool scene,
                                           const std::vector<TextureImage>& lower = {});
+// The texture as BGRA8, its colour as stored (not premultiplied); Unsupported for a layout that is not read here.
+TextureImage texture_bgra(const TextureImage& image);
+
 inline std::vector<TextureImage> upscale_2d_texture(const TextureImage& image) { return upscale_texture(image, false); }
 
 }  // namespace xport::pc
