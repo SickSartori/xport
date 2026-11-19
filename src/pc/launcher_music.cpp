@@ -9,6 +9,7 @@
 #include <xaudio2.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstring>
 #include <thread>
@@ -122,6 +123,23 @@ void LauncherMusic::update(float dt, float target) {
     if (!s.voice) return;
     s.level += (target - s.level) * std::min(1.0f, dt * 1.5f);
     s.voice->SetVolume(s.level * 0.6f * std::clamp(setting("launcher_music"), 0.0f, 100.0f) / 100.0f);
+}
+
+float LauncherMusic::loudness() const {
+    const State& s = *state_;
+    if (!s.voice || s.level < 0.01f) return 0;
+    XAUDIO2_VOICE_STATE played{};
+    s.voice->GetState(&played, 0);
+    const size_t frames = s.pcm.size() / 4, window = 1024;  // about 23 ms at 44.1 kHz
+    if (frames < window) return 0;
+    const size_t start = static_cast<size_t>(played.SamplesPlayed % frames);
+    double sum = 0;
+    for (size_t i = 0; i < window; ++i) {
+        int16_t sample[2];
+        std::memcpy(sample, s.pcm.data() + ((start + i) % frames) * 4, 4);
+        sum += (static_cast<double>(sample[0]) * sample[0] + static_cast<double>(sample[1]) * sample[1]) / 2;
+    }
+    return std::min(1.0f, static_cast<float>(std::sqrt(sum / window) / 32768.0 * 3.0) * s.level);
 }
 
 LauncherMusic::~LauncherMusic() {

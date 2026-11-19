@@ -13,6 +13,8 @@ public:
     ~LauncherMusic();  // fades out and stops
     // Call every frame: the fade follows `target` (0..1, times the volume setting).
     void update(float dt, float target);
+    // How loud the music is right now, 0..1 (the fade and the volume setting left out): for pictures that move with it.
+    float loudness() const;
 
 private:
     struct State;
