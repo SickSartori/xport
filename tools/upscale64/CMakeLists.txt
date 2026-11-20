@@ -21,6 +21,9 @@ if(DLSS_SDK)
     target_include_directories(upscale64 PRIVATE ${DLSS_SDK}/include)
     target_link_libraries(upscale64 PRIVATE
         $<IF:$<CONFIG:Debug>,${DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_s_dbg.lib,${DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib>)
-    add_custom_command(TARGET upscale64 POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DLSS_SDK}/lib/Windows_x86_64/rel/nvngx_dlss.dll $<TARGET_FILE_DIR:upscale64>)
+    # The DLL beside the program, when the SDK has it (the CI fetches only what the build needs).
+    if(EXISTS ${DLSS_SDK}/lib/Windows_x86_64/rel/nvngx_dlss.dll)
+        add_custom_command(TARGET upscale64 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DLSS_SDK}/lib/Windows_x86_64/rel/nvngx_dlss.dll $<TARGET_FILE_DIR:upscale64>)
+    endif()
 endif()
