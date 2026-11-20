@@ -215,7 +215,8 @@ float halton(int index, int base) {
 // render pixels a frame with their motion vectors, flat depth, Halton jitter. Prints the time a frame takes on the
 // GPU (timestamp queries) and the mean error of the last output against the stripes worked out at its pixels.
 void bench_dlss(ID3D11Device* device, Dlss& dlss, NVSDK_NGX_PerfQuality_Value mode, const char* name, const char* preset_name,
-                unsigned preset, unsigned width, unsigned height, unsigned out_width, unsigned out_height) {
+                unsigned preset, unsigned width, unsigned height, unsigned out_width, unsigned out_height, bool across = false,
+                int jitter_sign = -1) {
     ComPtr<ID3D11DeviceContext> context;
     device->GetImmediateContext(&context);
     const auto texture = [&](unsigned w, unsigned h, DXGI_FORMAT format, UINT bind, const void* data, UINT pitch, D3D11_USAGE usage = D3D11_USAGE_DEFAULT,
@@ -231,7 +232,8 @@ void bench_dlss(ID3D11Device* device, Dlss& dlss, NVSDK_NGX_PerfQuality_Value mo
     constexpr double kPeriod = 7, kStep = 3, kPi = 3.14159265358979;
     const auto stripes = [&](double u, int frame) { return 0.5 + 0.5 * std::sin(2 * kPi * (u - kStep * frame) / kPeriod); };
     const std::vector<float> depths(size_t{width} * height, 0.5f);
-    const std::vector<uint32_t> motion_data(size_t{width} * height, 0xC200u);  // R16G16_FLOAT (-3, 0): previous minus current
+    // R16G16_FLOAT, previous minus current: (-3, 0) for stripes moving right, (0, -3) for stripes moving down (across).
+    const std::vector<uint32_t> motion_data(size_t{width} * height, across ? 0xC2000000u : 0xC200u);
     std::vector<uint32_t> pixels(size_t{width} * height);
     const ComPtr<ID3D11Texture2D> colour = texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, nullptr, 0);
     const ComPtr<ID3D11Texture2D> depth = texture(width, height, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, depths.data(), width * 4);
@@ -257,11 +259,17 @@ void bench_dlss(ID3D11Device* device, Dlss& dlss, NVSDK_NGX_PerfQuality_Value mo
     constexpr int kFrames = 60;
     for (int frame = 0; frame < kFrames; ++frame) {
         const float jitter_x = halton(frame % 16 + 1, 2) - 0.5f, jitter_y = halton(frame % 16 + 1, 3) - 0.5f;
-        for (unsigned x = 0; x < width; ++x) {
-            const auto v = static_cast<uint32_t>(std::lround(stripes(x + 0.5 - jitter_x, frame) * 255));  // DLSS's jitter: pixel x shows the scene at x + 0.5 - jitter
-            pixels[x] = 0xFF000000u | (v << 16) | (v << 8) | v;
+        // DLSS's jitter: pixel (x, y) shows the scene at (x + 0.5 - jitter_x, y + 0.5 - jitter_y) (jitter_sign -1).
+        const auto grey = [&](double u, float jitter) {
+            const auto v = static_cast<uint32_t>(std::lround(stripes(u + 0.5 + jitter_sign * jitter, frame) * 255));
+            return 0xFF000000u | (v << 16) | (v << 8) | v;
+        };
+        if (!across) {
+            for (unsigned x = 0; x < width; ++x) pixels[x] = grey(x, jitter_x);
+            for (unsigned y = 1; y < height; ++y) std::copy_n(pixels.begin(), width, pixels.begin() + size_t{y} * width);
+        } else {
+            for (unsigned y = 0; y < height; ++y) std::fill_n(pixels.begin() + size_t{y} * width, width, grey(y, jitter_y));
         }
-        for (unsigned y = 1; y < height; ++y) std::copy_n(pixels.begin(), width, pixels.begin() + size_t{y} * width);
         context->UpdateSubresource(colour.Get(), 0, nullptr, pixels.data(), width * 4, 0);
         const Frame data{jitter_x, jitter_y, frame == 0, 1, 1, static_cast<uint32_t>(frame)};
         context->Begin(disjoint.Get());
@@ -282,9 +290,16 @@ void bench_dlss(ID3D11Device* device, Dlss& dlss, NVSDK_NGX_PerfQuality_Value mo
             context->CopyResource(staging.Get(), output.Get());
             D3D11_MAPPED_SUBRESOURCE mapped{};
             if (SUCCEEDED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-                const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(mapped.pData) + mapped.RowPitch * (out_height / 2));
-                for (unsigned x = 32; x < out_width - 32; ++x) {
-                    error += std::abs(double(row[x] & 0xFF) - stripes((x + 0.5) * width / out_width, frame) * 255) / (out_width - 64);
+                const auto* base = static_cast<const uint8_t*>(mapped.pData);
+                const auto at = [&](unsigned x, unsigned y) { return reinterpret_cast<const uint32_t*>(base + mapped.RowPitch * y)[x] & 0xFF; };
+                if (!across) {  // along the middle row
+                    for (unsigned x = 32; x < out_width - 32; ++x) {
+                        error += std::abs(double(at(x, out_height / 2)) - stripes((x + 0.5) * width / out_width, frame) * 255) / (out_width - 64);
+                    }
+                } else {  // down the middle column
+                    for (unsigned y = 32; y < out_height - 32; ++y) {
+                        error += std::abs(double(at(out_width / 2, y)) - stripes((y + 0.5) * height / out_height, frame) * 255) / (out_height - 64);
+                    }
                 }
                 context->Unmap(staging.Get(), 0);
             }
@@ -347,6 +362,15 @@ int probe_dlss() {
                 for (const auto& preset : presets) {
                     bench_dlss(device.Get(), dlss, m.value, m.title, preset.name, preset.value, width, height, out_width, out_height);
                 }
+            }
+        }
+        // Which way DLSS reads the jitter, across and down: Quality, preset K, 1280x720 to 1920x1080, the stripes drawn
+        // with the jitter subtracted (as above) and added. The right way has the smaller error.
+        for (const bool across : {false, true}) {
+            for (const int sign : {-1, 1}) {
+                std::printf("jitter %s, scene at pixel %s jitter:\n", across ? "down (y)" : "across (x)", sign < 0 ? "minus" : "plus");
+                bench_dlss(device.Get(), dlss, NVSDK_NGX_PerfQuality_Value_MaxQuality, "Quality", "K", NVSDK_NGX_DLSS_Hint_Render_Preset_K,
+                           1280, 720, 1920, 1080, across, sign);
             }
         }
     }
