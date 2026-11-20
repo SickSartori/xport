@@ -46,6 +46,9 @@ int main() {
     CHECK(points[1] == "A link and code, version 0.3.7.");
     CHECK(points[2] == "Caf\xC3\xA9 \"quoted\" \\ slash/ \xF0\x9F\x9A\x97");
     CHECK(release_points(notes, 1).size() == 1 && release_points("no list here", 5).empty());
+    // The list of files under the news is not news.
+    CHECK(release_points("### Fixed\n\n- A fix.\n\n### Which file?\n\n- **Windows**: the setup.\n", 6).size() == 1);
+    CHECK(release_points("- A fix.\n### Download\n- **Installer**: the setup.\n", 6).size() == 1);
 
     return test_result();
 }

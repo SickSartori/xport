@@ -129,6 +129,7 @@ inline std::vector<std::string> release_points(const std::string& notes, size_t 
         std::string line = notes.substr(start, end - start);
         start = end + 1;
         if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("### Download", 0) == 0 || line.rfind("### Which file", 0) == 0) break;  // the files, not news
         if (line.size() > 2 && (line[0] == '-' || line[0] == '*') && line[1] == ' ') {
             finish();
             point = line.substr(2);
