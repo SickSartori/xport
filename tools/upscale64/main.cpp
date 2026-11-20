@@ -3,11 +3,12 @@
 // into an output until the port's process ends.
 //
 //   upscale64.exe <port process ID> <adapter LUID high:low> <input w> <input h> <output w> <output h> [mode]
-//   upscale64.exe --probe
+//   upscale64.exe --check | --probe
 //
 // mode: bilinear (the default; any card), or dlaa, quality, balanced, performance: NVIDIA DLSS (NGX, 64-bit only),
 // when built with the DLSS SDK (-DDLSS_SDK). A DLSS mode that cannot start ends the program with code 4.
-// --probe: whether DLSS runs on the high-performance card, and its time on made-up frames.
+// --check: whether DLSS runs on the high-performance card, in one line (for a launcher). --probe: that, and its time
+// and picture on made-up frames for each mode and preset.
 // Plan: sick-xport docs/UPSCALING-DLSS-FSR.md.
 
 #include <windows.h>
@@ -381,6 +382,38 @@ int probe_dlss() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // --check: one line and an exit code, for a launcher deciding whether to offer DLSS. 0: it runs on the
+    // high-performance card, 3: it does not (or the driver is too old), 2: NGX did not start, 4: built without DLSS.
+    if (argc == 2 && std::wcscmp(argv[1], L"--check") == 0) {
+#ifdef XPORT_DLSS
+        ComPtr<IDXGIFactory6> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+            factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
+        }
+        DXGI_ADAPTER_DESC1 adapter_desc{};
+        if (adapter) adapter->GetDesc1(&adapter_desc);
+        ComPtr<ID3D11Device> device;
+        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, levels, 2, D3D11_SDK_VERSION, &device,
+                                     nullptr, nullptr))) {
+            std::printf("DLSS: no Direct3D 11 device\n");
+            return 2;
+        }
+        Dlss dlss;
+        if (!dlss.start(device.Get())) {
+            int needs_driver = 0;
+            if (dlss.parameters) NVSDK_NGX_Parameter_GetI(dlss.parameters, NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
+            std::printf("DLSS: not available on %ls%s\n", adapter_desc.Description, needs_driver ? " (a newer driver is needed)" : "");
+            return dlss.device ? 3 : 2;
+        }
+        std::printf("DLSS: available on %ls\n", adapter_desc.Description);
+        return 0;
+#else
+        std::printf("DLSS: not in this build\n");
+        return 4;
+#endif
+    }
 #ifdef XPORT_DLSS
     if (argc == 2 && std::wcscmp(argv[1], L"--probe") == 0) return probe_dlss();
 #endif

@@ -1,0 +1,33 @@
+// Version information for upscale64.exe, shown by Windows in the file's properties and by Task Manager as the
+// process's name: the port it belongs to (UPSCALE64_PRODUCT, UPSCALE64_VERSION in CMake), so that it reads as part of it.
+#include <winver.h>
+#include "upscale64_version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION UPSCALE64_VERSION_NUMBERS
+PRODUCTVERSION UPSCALE64_VERSION_NUMBERS
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", UPSCALE64_PRODUCT
+            VALUE "FileDescription", UPSCALE64_PRODUCT " DLSS helper"
+            VALUE "FileVersion", UPSCALE64_VERSION
+            VALUE "InternalName", "upscale64.exe"
+            VALUE "LegalCopyright", "MIT licence. NVIDIA DLSS is NVIDIA's, under its own licence."
+            VALUE "OriginalFilename", "upscale64.exe"
+            VALUE "ProductName", UPSCALE64_PRODUCT
+            VALUE "ProductVersion", UPSCALE64_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

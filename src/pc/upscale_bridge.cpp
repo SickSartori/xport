@@ -3,6 +3,7 @@
 #include <dxgi1_2.h>
 
 #include <cstdio>
+#include <vector>
 
 namespace xport::pc {
 
@@ -91,11 +92,59 @@ bool UpscaleBridge::start(ID3D11Device* device, const std::wstring& helper, uint
                   static_cast<unsigned long>(adapter_desc.AdapterLuid.HighPart),
                   static_cast<unsigned long>(adapter_desc.AdapterLuid.LowPart), input_width, input_height, output_width,
                   output_height, mode);
-    STARTUPINFOW startup{sizeof(startup)};
-    if (!CreateProcessW(helper.c_str(), arguments, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                        &process_)) {
-        return fail("cannot start the helper", HRESULT_FROM_WIN32(GetLastError()));
+    // What the helper writes (stdout and stderr) comes back through a pipe, line by line, to set_log's function: the
+    // port's log. Only the pipe's end is handed to it, not every handle the port could pass on.
+    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    HANDLE log_write = nullptr;
+    if (!CreatePipe(&log_read_, &log_write, &inherit, 0)) return fail("cannot make the log pipe", HRESULT_FROM_WIN32(GetLastError()));
+    SetHandleInformation(log_read_, HANDLE_FLAG_INHERIT, 0);
+    SIZE_T list_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &list_size);
+    std::vector<char> list_memory(list_size);
+    const auto list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(list_memory.data());
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdOutput = startup.StartupInfo.hStdError = log_write;
+    startup.lpAttributeList = list;
+    const bool listed = InitializeProcThreadAttributeList(list, 1, 0, &list_size) &&
+                        UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &log_write, sizeof(log_write),
+                                                  nullptr, nullptr);
+    // Suspended until it is in the job below: no moment when the port could end and leave it running.
+    const bool started = listed && CreateProcessW(helper.c_str(), arguments, nullptr, nullptr, TRUE,
+                                                  CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                                                  nullptr, nullptr, &startup.StartupInfo, &process_);
+    const DWORD start_error = GetLastError();
+    if (listed) DeleteProcThreadAttributeList(list);
+    CloseHandle(log_write);  // the helper's copy is the only one: the pipe ends with it
+    if (!started) return fail("cannot start the helper", HRESULT_FROM_WIN32(start_error));
+    // A job that ends the helper when the port's process ends however it ends (a crash too): Windows closes the job's
+    // handle with the process.
+    job_ = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!job_ || !SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+        !AssignProcessToJobObject(job_, process_.hProcess)) {
+        return fail("cannot tie the helper to the port", HRESULT_FROM_WIN32(GetLastError()));
     }
+    ResumeThread(process_.hThread);
+    log_thread_ = std::thread([this] {
+        char buffer[512];
+        std::string line;
+        DWORD read = 0;
+        const auto emit = [&] {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty() && log_) log_(line.c_str());
+            line.clear();
+        };
+        while (ReadFile(log_read_, buffer, sizeof(buffer), &read, nullptr) && read) {
+            for (DWORD i = 0; i < read; ++i) {
+                if (buffer[i] == '\n') emit();
+                else line += buffer[i];
+            }
+        }
+        emit();
+    });
     const HANDLE waits[2] = {ready_, process_.hProcess};
     const DWORD woke = WaitForMultipleObjects(2, waits, FALSE, timeout_ms);
     if (woke != WAIT_OBJECT_0) {
@@ -119,6 +168,11 @@ void UpscaleBridge::stop() {
         CloseHandle(process_.hThread);
         process_ = {};
     }
+    if (job_) CloseHandle(job_);
+    job_ = nullptr;
+    if (log_thread_.joinable()) log_thread_.join();  // the pipe ended with the helper: its last lines are in the log
+    if (log_read_) CloseHandle(log_read_);
+    log_read_ = nullptr;
     if (frame_) UnmapViewOfFile(frame_);
     frame_ = nullptr;
     for (HANDLE* handle : {&ready_, &frame_mapping_}) {

@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "pc/port.h"
@@ -79,6 +81,22 @@ int main() {
                                  levels, 2, D3D11_SDK_VERSION, &device, nullptr, &context))) {
         std::printf("skipped: no Direct3D 11 device\n");
         return 77;
+    }
+
+    // What the helper writes reaches the port's log: an unknown mode makes it say so and end (code 4).
+    {
+        static std::mutex lines_mutex;
+        static std::vector<std::string> lines;
+        UpscaleBridge bridge;
+        bridge.set_log([](const char* line) {
+            std::lock_guard<std::mutex> lock(lines_mutex);
+            lines.emplace_back(line);
+        });
+        CHECK(!bridge.start(device.Get(), helper, 64, 32, 128, 64, "no-such-mode"));
+        std::printf("unknown mode: %s\n", bridge.error().c_str());
+        std::lock_guard<std::mutex> lock(lines_mutex);
+        CHECK(!lines.empty() && lines[0].rfind("upscale64: ", 0) == 0);
+        for (const std::string& line : lines) std::printf("  helper said: %s\n", line.c_str());
     }
 
     // Stretched: left red and right blue, then the other way round; each comes back twice as large (RGBA).

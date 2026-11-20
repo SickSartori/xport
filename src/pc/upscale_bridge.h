@@ -10,7 +10,8 @@
 //   port:   reads the output -> release_output (key 0)
 //
 // What each frame needs besides the pictures (jitter, a cut) goes through a small shared memory block. The helper
-// runs until the port's process ends. Plan: sick-xport docs/UPSCALING-DLSS-FSR.md (F5).
+// runs until the port stops it or the port's process ends, a crash too (a job object); what it writes goes to the
+// port's log (set_log). Plan: sick-xport docs/UPSCALING-DLSS-FSR.md (F5).
 
 #include <windows.h>
 #include <d3d11_1.h>
@@ -18,6 +19,7 @@
 
 #include <cstdint>
 #include <string>
+#include <thread>
 
 namespace xport::pc {
 
@@ -47,6 +49,10 @@ public:
                uint32_t output_width, uint32_t output_height, const char* mode = "bilinear", DWORD timeout_ms = 10000);
     void stop();
 
+    // Where the helper's own lines go (its errors, DLSS's state): the port's log. Before start; none by default.
+    void set_log(void (*log)(const char* line)) { log_ = log; }
+    DWORD helper_process() const { return process_.dwProcessId; }
+
     ID3D11Texture2D* colour() const { return colour_shared_.texture.Get(); }
     ID3D11Texture2D* depth() const { return depth_shared_.texture.Get(); }
     ID3D11Texture2D* motion() const { return motion_shared_.texture.Get(); }
@@ -70,7 +76,9 @@ private:
                   Shared& shared);
 
     Shared colour_shared_, depth_shared_, motion_shared_, output_shared_;
-    HANDLE ready_ = nullptr, frame_mapping_ = nullptr;
+    HANDLE ready_ = nullptr, frame_mapping_ = nullptr, job_ = nullptr, log_read_ = nullptr;
+    std::thread log_thread_;
+    void (*log_)(const char* line) = nullptr;
     UpscaleFrame* frame_ = nullptr;
     uint32_t frames_ = 0;
     PROCESS_INFORMATION process_{};
