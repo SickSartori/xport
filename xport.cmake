@@ -76,4 +76,8 @@ function(xport_add_tests name name_upper env_prefix)
     xport_test(test_crash_report ${XPORT_DIR}/src/pc/crash_report.cpp)
     xport_test(test_camera_motion)
     target_link_libraries(test_camera_motion PRIVATE d3dcompiler)
+    # The 64-bit helper is built apart (tools/upscale64); without it the test is skipped.
+    xport_test(test_upscale_bridge ${XPORT_DIR}/src/pc/upscale_bridge.cpp)
+    target_link_libraries(test_upscale_bridge PRIVATE d3d11 dxgi)
+    set_tests_properties(test_upscale_bridge PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
