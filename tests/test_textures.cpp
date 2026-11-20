@@ -154,14 +154,20 @@ void test_enlarger() {
     CHECK(upscale_2d_texture(bgra(256, 256))[0].width == 512);
     CHECK(upscale_2d_texture(bgra(1024, 1024)).empty());
     CHECK(upscale_2d_texture(bgra(2, 2)).empty());
-    const auto levels = upscale_2d_texture(bgra(256, 128));
-    CHECK(levels.size() == 10);
-    for (size_t i = 1; i < levels.size(); ++i) {
-        CHECK(levels[i].width == std::max(1u, levels[i - 1].width / 2));
-        CHECK(levels[i].height == std::max(1u, levels[i - 1].height / 2));
-        CHECK(levels[i].data.size() == size_t{levels[i].width} * levels[i].height * 4);
+    // Each level half the one above, down to 1x1: twice and four times larger, the HUD's and the scene's (four times
+    // larger, the twice larger level came twice, 11 levels for 512x256, and Direct3D refused the texture).
+    for (const auto& levels : {upscale_2d_texture(bgra(256, 128)), upscale_2d_texture(bgra(128, 64)),
+                               upscale_texture(bgra(64, 64), true), upscale_texture(bgra(128, 128), true)}) {
+        uint32_t expected = 1;
+        for (uint32_t side = std::max(levels[0].width, levels[0].height); side > 1; side /= 2) ++expected;
+        CHECK(levels.size() == expected);
+        for (size_t i = 1; i < levels.size(); ++i) {
+            CHECK(levels[i].width == std::max(1u, levels[i - 1].width / 2));
+            CHECK(levels[i].height == std::max(1u, levels[i - 1].height / 2));
+            CHECK(levels[i].data.size() == size_t{levels[i].width} * levels[i].height * 4);
+        }
+        CHECK(levels.back().width == 1 && levels.back().height == 1);
     }
-    CHECK(levels.back().width == 1 && levels.back().height == 1);
 
     // One colour stays that colour exactly.
     TextureImage solid = bgra(32, 32);

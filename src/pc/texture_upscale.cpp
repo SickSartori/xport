@@ -297,10 +297,8 @@ std::vector<TextureImage> upscale_texture(const TextureImage& image, bool scene,
     // scene's textures twice, four times only the smallest: there are over a thousand of them at once.
     picture = twice(picture);
     std::vector<TextureImage> levels{to_bgra(picture)};
-    if (largest <= (scene ? 64u : 128u)) {
-        picture = twice(picture);
-        levels.insert(levels.begin(), to_bgra(picture));
-    }
+    // The four times larger level goes on top; `picture` stays the twice larger one, which the levels below go on from.
+    if (largest <= (scene ? 64u : 128u)) levels.insert(levels.begin(), to_bgra(twice(picture)));
     if (scene) {
         // Below the enlarged levels come the game's own, as they are: from afar the scene looks as it did (the game's
         // lower levels are not its top one made smaller: a road's are smoother and lighter, and with ours made from
