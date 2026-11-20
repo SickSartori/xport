@@ -61,8 +61,11 @@ public:
 
     bool acquire_input(DWORD timeout_ms = 1000);
     // The inputs are drawn: the helper takes them with `frame`; true once the output is ready (and held until
-    // release_output).
+    // release_output). submit is send then receive; apart, the port can draw on while the helper works (send this
+    // frame, then receive it a frame later, showing the one before).
     bool submit(ID3D11DeviceContext* context, const UpscaleFrame& frame = {}, DWORD timeout_ms = 1000);
+    bool send(ID3D11DeviceContext* context, const UpscaleFrame& frame = {});
+    bool receive(DWORD timeout_ms = 1000);
     void release_output();
 
 private:

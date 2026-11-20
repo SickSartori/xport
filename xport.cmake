@@ -46,6 +46,7 @@ set(XPORT_RUNTIME_SOURCES
     ${XPORT_DIR}/src/pc/profile.cpp
     ${XPORT_DIR}/src/pc/renderer_d3d11.cpp
     ${XPORT_DIR}/src/pc/texture_upscale.cpp
+    ${XPORT_DIR}/src/pc/upscale_bridge.cpp
     ${XPORT_DIR}/src/pc/xbox_thread.cpp
 )
 

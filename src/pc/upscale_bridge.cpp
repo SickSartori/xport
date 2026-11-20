@@ -193,6 +193,10 @@ bool UpscaleBridge::acquire_input(DWORD timeout_ms) {
 }
 
 bool UpscaleBridge::submit(ID3D11DeviceContext* context, const UpscaleFrame& frame, DWORD timeout_ms) {
+    return send(context, frame) && receive(timeout_ms);
+}
+
+bool UpscaleBridge::send(ID3D11DeviceContext* context, const UpscaleFrame& frame) {
     if (!frame_ || !output_shared_.lock) return false;
     *frame_ = frame;
     frame_->number = ++frames_;
@@ -200,7 +204,11 @@ bool UpscaleBridge::submit(ID3D11DeviceContext* context, const UpscaleFrame& fra
     for (Shared* shared : {&colour_shared_, &depth_shared_, &motion_shared_}) {
         if (FAILED(shared->lock->ReleaseSync(1))) return false;
     }
-    return output_shared_.lock->AcquireSync(1, timeout_ms) == S_OK;
+    return true;
+}
+
+bool UpscaleBridge::receive(DWORD timeout_ms) {
+    return output_shared_.lock && output_shared_.lock->AcquireSync(1, timeout_ms) == S_OK;
 }
 
 void UpscaleBridge::release_output() {

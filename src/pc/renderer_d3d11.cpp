@@ -42,6 +42,7 @@
 #include "pc/settings.h"
 #include "pc/texture_page_hash.h"
 #include "pc/texture_upscale.h"
+#include "pc/upscale_bridge.h"
 
 namespace xport::pc {
 
@@ -2242,11 +2243,158 @@ void apply_scene_effects(Target& target, const SceneState& scene, uint32_t addre
     g_graded_surfaces.insert(address);
 }
 
+// --- DLSS, an experiment (<GAME>_DLSS=dlaa|quality|balanced|performance) ---
+//
+// The finished frame (internal resolution, HUD included) upscaled to the window's picture by NVIDIA DLSS in the 64-bit
+// helper (upscale_bridge.h, tools/upscale64 next to the game's exe, or <GAME>_UPSCALE64), instead of the bilinear
+// stretch. For measuring and trying it: no jitter and no motion vectors yet (flat depth, still vectors), the HUD goes
+// through DLSS too. The plan's way (the scene alone, jittered, with vectors) is in sick-xport
+// docs/UPSCALING-DLSS-FSR.md. A frame behind: each present sends its frame and shows the one the helper made from the
+// frame before (copied out of the shared texture), so neither waits for the other.
+struct DlssPresent {
+    UpscaleBridge bridge;
+    uint32_t input_width = 0, input_height = 0, output_width = 0, output_height = 0;
+    ComPtr<ID3D11Texture2D> shown;  // the helper's last output, ours to draw
+    ComPtr<ID3D11ShaderResourceView> shown_view;
+    ComPtr<ID3D11RenderTargetView> depth, motion;
+    bool failed = false, fresh = false, pending = false, has_shown = false;
+    double waited_ms = 0;  // for the helper's output and for the inputs back, since the last log line
+    uint32_t frames = 0;
+};
+DlssPresent g_dlss;
+
+// Experimental: only with upscale64.exe beside the game's exe (not in the release packages yet), so a setting without
+// it changes nothing.
+bool dlss_helper_present() {
+    static const bool present = [] {
+        std::error_code ignored;
+        return std::filesystem::exists(program_directory() / L"upscale64.exe", ignored);
+    }();
+    return present;
+}
+
+// The settings upscaler (2: DLSS) and upscaler_quality (0 DLAA, 1 Quality, 2 Balanced, 3 Performance), read at start;
+// <GAME>_DLSS=<mode> for tests (it keeps render_scale as it is).
+const char* dlss_mode() {
+    static const char* mode = []() -> const char* {
+        static char asked[32] = {};
+        if (GetEnvironmentVariableA(XPORT_ENV("DLSS"), asked, sizeof(asked)) > 0) return asked[0] && asked[0] != '0' ? asked : nullptr;
+        if (setting_at_start("upscaler") != 2 || !dlss_helper_present()) return nullptr;
+        static const char* const kModes[] = {"dlaa", "quality", "balanced", "performance"};
+        return kModes[std::clamp(static_cast<int>(setting_at_start("upscaler_quality")), 0, 3)];
+    }();
+    return mode;
+}
+
+// The screen's lines over the drawn ones for the setting's profile (DLSS's own: Quality 1.5, Balanced 1.72,
+// Performance 2), or 0 when the setting asks for no upscaling.
+float upscaler_ratio() {
+    if (setting_at_start("upscaler") != 2 || !dlss_helper_present()) return 0;
+    static const float kRatios[] = {1.0f, 1.5f, 1.72f, 2.0f};
+    return kRatios[std::clamp(static_cast<int>(setting_at_start("upscaler_quality")), 0, 3)];
+}
+
+// `frame` sent to DLSS for output_width x output_height; the view of the picture it made from the frame before, or
+// null (the first frame; no DLSS asked, or it cannot run: said once in the log).
+ID3D11ShaderResourceView* dlss_upscale(ID3D11ShaderResourceView* frame, uint32_t input_width, uint32_t input_height,
+                                       uint32_t output_width, uint32_t output_height) {
+    if (!dlss_mode() || g_dlss.failed || !frame || !input_width || !output_width) return nullptr;
+    ComPtr<ID3D11Resource> source;
+    frame->GetResource(&source);
+    ComPtr<ID3D11Texture2D> source_texture;
+    D3D11_TEXTURE2D_DESC source_desc{};
+    if (FAILED(source.As(&source_texture))) return nullptr;
+    source_texture->GetDesc(&source_desc);
+    if (source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        log_line("renderer: DLSS: the frame is not BGRA8 (format %u), not upscaled", static_cast<unsigned>(source_desc.Format));
+        g_dlss.failed = true;
+        return nullptr;
+    }
+    if (!g_dlss.shown || g_dlss.input_width != input_width || g_dlss.input_height != input_height ||
+        g_dlss.output_width != output_width || g_dlss.output_height != output_height) {
+        g_dlss.bridge.stop();
+        g_dlss.shown.Reset(), g_dlss.shown_view.Reset(), g_dlss.depth.Reset(), g_dlss.motion.Reset();
+        g_dlss.pending = g_dlss.has_shown = false;
+        wchar_t path[MAX_PATH] = {};
+        const std::wstring helper = GetEnvironmentVariableW(XPORT_ENV_W("UPSCALE64"), path, MAX_PATH)
+                                        ? std::wstring(path)
+                                        : (program_directory() / L"upscale64.exe").wstring();
+        g_dlss.bridge.set_log([](const char* line) { log_line("%s", line); });
+        const uint64_t started = ticks();
+        if (!g_dlss.bridge.start(g_device.Get(), helper, input_width, input_height, output_width, output_height, dlss_mode())) {
+            log_line("renderer: DLSS did not start (%s): the bilinear stretch stays", g_dlss.bridge.error().c_str());
+            g_dlss.failed = true;
+            return nullptr;
+        }
+        D3D11_TEXTURE2D_DESC shown_desc{};
+        g_dlss.bridge.output()->GetDesc(&shown_desc);
+        shown_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        shown_desc.MiscFlags = 0;
+        g_device->CreateTexture2D(&shown_desc, nullptr, &g_dlss.shown);
+        if (g_dlss.shown) g_device->CreateShaderResourceView(g_dlss.shown.Get(), nullptr, &g_dlss.shown_view);
+        g_device->CreateRenderTargetView(g_dlss.bridge.depth(), nullptr, &g_dlss.depth);
+        g_device->CreateRenderTargetView(g_dlss.bridge.motion(), nullptr, &g_dlss.motion);
+        g_dlss.input_width = input_width, g_dlss.input_height = input_height;
+        g_dlss.output_width = output_width, g_dlss.output_height = output_height;
+        g_dlss.fresh = true;
+        log_line("renderer: DLSS %s, %ux%u to %ux%u (helper started in %.0f ms)", dlss_mode(), input_width, input_height,
+                 output_width, output_height, milliseconds(ticks() - started));
+    }
+    const uint64_t before = ticks();
+    // The picture the helper made from the last frame: ours to show from now on.
+    if (g_dlss.pending) {
+        if (!g_dlss.bridge.receive(500)) {
+            log_line("renderer: DLSS: no output from the helper: the bilinear stretch stays");
+            g_dlss.failed = true;
+            return nullptr;
+        }
+        g_context->CopyResource(g_dlss.shown.Get(), g_dlss.bridge.output());
+        g_dlss.bridge.release_output();
+        g_dlss.pending = false;
+        g_dlss.has_shown = true;
+    }
+    // This frame to the helper (the inputs came back with that output).
+    if (!g_dlss.bridge.acquire_input(200)) {
+        log_line("renderer: DLSS: the helper did not give the input back: the bilinear stretch stays");
+        g_dlss.failed = true;
+        return nullptr;
+    }
+    g_dlss.waited_ms += milliseconds(ticks() - before);
+    const D3D11_BOX box{0, 0, 0, input_width, input_height, 1};
+    g_context->CopySubresourceRegion(g_dlss.bridge.colour(), 0, 0, 0, 0, source_texture.Get(), 0, &box);
+    if (g_dlss.fresh) {  // flat depth and no motion, once: they stay
+        const float flat[4] = {0.5f, 0, 0, 0}, still[4] = {0, 0, 0, 0};
+        g_context->ClearRenderTargetView(g_dlss.depth.Get(), flat);
+        g_context->ClearRenderTargetView(g_dlss.motion.Get(), still);
+    }
+    UpscaleFrame frame_data;
+    frame_data.reset = g_dlss.fresh;
+    g_dlss.fresh = false;
+    if (!g_dlss.bridge.send(g_context.Get(), frame_data)) {
+        log_line("renderer: DLSS: the helper could not take the frame: the bilinear stretch stays");
+        g_dlss.failed = true;
+        return nullptr;
+    }
+    g_dlss.pending = true;
+    ++g_dlss.frames;
+    return g_dlss.has_shown ? g_dlss.shown_view.Get() : nullptr;
+}
+
 // Draws the frame into the window: the largest rectangle of the picture's shape (renderer_aspect) that fits,
 // centred, filtered, with the effects.
 void present_frame(ID3D11ShaderResourceView* frame, uint32_t frame_width, uint32_t frame_height, bool graded) {
     const ForgetBound forget;
     if (!g_final_rtv || !g_present_pixel_shader) return;
+    if (dlss_mode()) {
+        const float aspect = g_shown_aspect > 0 ? g_shown_aspect : renderer_aspect();
+        float width = static_cast<float>(g_swap_width), height = static_cast<float>(g_swap_height);
+        if (width > height * aspect) width = height * aspect;
+        else height = width / aspect;
+        if (ID3D11ShaderResourceView* upscaled = dlss_upscale(frame, frame_width, frame_height, static_cast<uint32_t>(width),
+                                                              static_cast<uint32_t>(height))) {
+            frame = upscaled, frame_width = g_dlss.output_width, frame_height = g_dlss.output_height;
+        }
+    }
     if (g_effects_enabled && g_final_pixel_shader && frame_width && frame_height) {
         const float aspect = g_shown_aspect > 0 ? g_shown_aspect : renderer_aspect();
         float width = static_cast<float>(g_swap_width), height = static_cast<float>(g_swap_height);
@@ -2430,10 +2578,13 @@ bool renderer_start(HWND window) {
     // up or down in height. The game draws 480; 2160 (4K) at most.
     const float requested = setting_at_start("render_scale");
     float scale = requested;
-    if (requested <= 0) {
+    const float ratio = upscaler_ratio();
+    if (requested <= 0 || ratio > 0) {
         MONITORINFO monitor{sizeof(MONITORINFO)};
         GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY), &monitor);
         scale = static_cast<float>(monitor.rcMonitor.bottom - monitor.rcMonitor.top) / 480.0f;
+        // Upscaling: the profile's share of the screen's lines, which DLSS brings back to the window.
+        if (ratio > 0) scale /= ratio;
     }
     // On laptops with two GPUs Windows' default adapter is the integrated one: ask DXGI 1.6 for the fast one instead
     // (the player's choice for the game's exe in Windows' graphics settings still wins). <GAME>_GPU_PREFERENCE=0: Windows' default.
@@ -2475,7 +2626,7 @@ bool renderer_start(HWND window) {
     }
     g_scale = std::clamp(scale, 1.0f, 6.0f);
     log_line("renderer: internal resolution %.0f lines (%.3gx)%s", 480.0f * g_scale, g_scale,
-             requested <= 0 ? ", automatic" : "");
+             ratio > 0 ? ", the upscaling profile's" : requested <= 0 ? ", automatic" : "");
     g_context.As(&g_context1);
 
     ComPtr<IDXGIDevice> dxgi_device;
@@ -3838,6 +3989,11 @@ void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_
     }
     if (g_presented % 600 == 599) {
         log_line("renderer: ambient occlusion on %u of %u scenes", g_occlusion_scenes, g_full_depth_clears);
+        if (g_dlss.frames) {
+            log_line("renderer: DLSS %s: waited %.2f ms a frame for the helper over %u frames", dlss_mode(),
+                     g_dlss.waited_ms / g_dlss.frames, g_dlss.frames);
+            g_dlss.waited_ms = 0, g_dlss.frames = 0;
+        }
         g_occlusion_scenes = g_full_depth_clears = 0;
     }
     D3D11_TEXTURE2D_DESC frame_desc{};
