@@ -111,7 +111,10 @@ bool UpscaleBridge::start(ID3D11Device* device, const std::wstring& helper, uint
 
 void UpscaleBridge::stop() {
     if (process_.hProcess) {
+        // Gone for good before the names are given again: while it still holds the shared objects, a new start
+        // cannot make objects of the same names.
         if (WaitForSingleObject(process_.hProcess, 0) == WAIT_TIMEOUT) TerminateProcess(process_.hProcess, 0);
+        WaitForSingleObject(process_.hProcess, 5000);
         CloseHandle(process_.hProcess);
         CloseHandle(process_.hThread);
         process_ = {};

@@ -144,5 +144,64 @@ int main() {
     CHECK(r > 200 && g < 40 && b < 40);
     std::printf("DLSS Quality 1280x720 -> 1920x1080 through the bridge: %.2f ms a frame\n",
                 (end.QuadPart - begin.QuadPart) * 1000.0 / frequency.QuadPart / std::max(done - 20, 1));
+    dlss.stop();
+
+    // Which way the motion vectors point. Fine stripes (a sine of 7 render pixels) scroll right, 3 render pixels a
+    // frame; DLSS gets the vectors as previous minus current position (what camera_motion.h writes), as zero, and
+    // turned the other way. With the right way its history lines up with the picture and the stripes stay sharp and
+    // in place; otherwise it blends stripes of other phases. The error is against the stripes worked out exactly at
+    // the output's pixels, along the middle row.
+    const auto stripes_error = [&](float sign) -> double {
+        constexpr UINT kWidth = 1280, kHeight = 720, kOutWidth = 1920, kOutHeight = 1080;
+        constexpr double kPeriod = 7, kStep = 3, kPi = 3.14159265358979;
+        constexpr int kSteps = 40;
+        const auto stripes = [&](double u, int frame) { return 0.5 + 0.5 * std::sin(2 * kPi * (u - kStep * frame) / kPeriod); };
+        UpscaleBridge scroll;
+        if (!scroll.start(device.Get(), helper, kWidth, kHeight, kOutWidth, kOutHeight, "quality")) return -1;
+        std::vector<uint32_t> colour(size_t{kWidth} * kHeight);
+        // R16G16_FLOAT: x = -3 * sign (half floats: -3 is 0xC200, 3 is 0x4200), y = 0.
+        const std::vector<uint32_t> motion(size_t{kWidth} * kHeight, sign == 0 ? 0u : sign > 0 ? 0xC200u : 0x4200u);
+        double error = 0;
+        for (int i = 0; i < kSteps; ++i) {
+            for (UINT x = 0; x < kWidth; ++x) {
+                const auto v = static_cast<uint32_t>(std::lround(stripes(x + 0.5, i) * 255));
+                colour[x] = 0xFF000000u | (v << 16) | (v << 8) | v;
+            }
+            for (UINT y = 1; y < kHeight; ++y) std::copy_n(colour.begin(), kWidth, colour.begin() + size_t{y} * kWidth);
+            if (!scroll.acquire_input()) return -1;
+            context->UpdateSubresource(scroll.colour(), 0, nullptr, colour.data(), kWidth * 4, 0);
+            if (i == 0) {
+                context->UpdateSubresource(scroll.motion(), 0, nullptr, motion.data(), kWidth * 4, 0);
+                fill(context.Get(), scroll.depth(), 0x3F000000u, kWidth, kHeight);
+            }
+            UpscaleFrame frame;
+            frame.reset = i == 0;
+            if (!scroll.submit(context.Get(), frame, 3000)) return -1;
+            if (i == kSteps - 1) {
+                D3D11_TEXTURE2D_DESC desc{};
+                scroll.output()->GetDesc(&desc);
+                desc.BindFlags = 0, desc.MiscFlags = 0, desc.Usage = D3D11_USAGE_STAGING, desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                ComPtr<ID3D11Texture2D> staging;
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                if (FAILED(device->CreateTexture2D(&desc, nullptr, &staging))) return -1;
+                context->CopyResource(staging.Get(), scroll.output());
+                if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return -1;
+                const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(mapped.pData) + mapped.RowPitch * (kOutHeight / 2));
+                for (UINT x = 32; x < kOutWidth - 32; ++x) {  // away from the sides, where the history runs out
+                    const double truth = stripes((x + 0.5) * kWidth / kOutWidth, i) * 255;
+                    error += std::abs(double(row[x] & 0xFF) - truth) / (kOutWidth - 64);
+                }
+                context->Unmap(staging.Get(), 0);
+            }
+            scroll.release_output();
+        }
+        return error;
+    };
+    const double right_way = stripes_error(1), no_motion = stripes_error(0), wrong_way = stripes_error(-1);
+    std::printf("scrolling stripes, mean error against the truth (of 255): vectors previous-minus-current %.1f, none %.1f,"
+                " reversed %.1f\n", right_way, no_motion, wrong_way);
+    CHECK(right_way >= 0 && no_motion >= 0 && wrong_way >= 0);
+    CHECK(right_way < wrong_way);
+    CHECK(right_way < no_motion);
     return test_result();
 }
