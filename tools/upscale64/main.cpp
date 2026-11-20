@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <cwchar>
 #include <iterator>
 #include <string>
@@ -169,12 +170,19 @@ struct Dlss {
     }
 
     bool make(ID3D11DeviceContext* context, NVSDK_NGX_PerfQuality_Value mode, UINT input_width, UINT input_height,
-              UINT output_width, UINT output_height) {
+              UINT output_width, UINT output_height, unsigned preset = NVSDK_NGX_DLSS_Hint_Render_Preset_K) {
         NVSDK_NGX_DLSS_Create_Params create{};
         create.Feature.InWidth = input_width, create.Feature.InHeight = input_height;
         create.Feature.InTargetWidth = output_width, create.Feature.InTargetHeight = output_height;
         create.Feature.InPerfQualityValue = mode;
         create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;  // vectors at the render size, LDR colour
+        // Preset K by default, in every mode. Measured with --probe on an RTX A500 (scrolling stripes, 1080p and 1440p): K is as
+        // good as or better than the others and the cheapest, while M (SDK 310's default for Performance) took twice
+        // the time and L and M in DLAA seven to nine times, for no better picture.
+        for (const char* hint : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                                 NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance}) {
+            NVSDK_NGX_Parameter_SetUI(parameters, hint, preset);
+        }
         const NVSDK_NGX_Result result = NGX_D3D11_CREATE_DLSS_EXT(context, &feature, parameters, &create);
         if (NVSDK_NGX_FAILED(result)) std::fprintf(stderr, "upscale64: DLSS could not be made: %08X\n", static_cast<unsigned>(result));
         return NVSDK_NGX_SUCCEED(result);
@@ -203,52 +211,59 @@ float halton(int index, int base) {
     return r;
 }
 
-// DLSS made and run on made-up frames (a gradient, flat depth, no motion, the jitter a game would use): the time a
-// frame takes on the GPU, from timestamp queries, for `mode` from width x height to 2560x1440.
-void bench_dlss(ID3D11Device* device, Dlss& dlss, NVSDK_NGX_PerfQuality_Value mode, const char* name, unsigned width,
-                unsigned height) {
+// DLSS made and run on made-up frames for one mode and preset: fine stripes (a sine of 7 render pixels) scrolling 3
+// render pixels a frame with their motion vectors, flat depth, Halton jitter. Prints the time a frame takes on the
+// GPU (timestamp queries) and the mean error of the last output against the stripes worked out at its pixels.
+void bench_dlss(ID3D11Device* device, Dlss& dlss, NVSDK_NGX_PerfQuality_Value mode, const char* name, const char* preset_name,
+                unsigned preset, unsigned width, unsigned height, unsigned out_width, unsigned out_height) {
     ComPtr<ID3D11DeviceContext> context;
     device->GetImmediateContext(&context);
-    const auto texture = [&](unsigned w, unsigned h, DXGI_FORMAT format, UINT bind, const void* data, UINT pitch) {
+    const auto texture = [&](unsigned w, unsigned h, DXGI_FORMAT format, UINT bind, const void* data, UINT pitch, D3D11_USAGE usage = D3D11_USAGE_DEFAULT,
+                             UINT cpu = 0) {
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = w, desc.Height = h, desc.MipLevels = 1, desc.ArraySize = 1, desc.Format = format;
-        desc.SampleDesc.Count = 1, desc.BindFlags = bind;
+        desc.SampleDesc.Count = 1, desc.BindFlags = bind, desc.Usage = usage, desc.CPUAccessFlags = cpu;
         D3D11_SUBRESOURCE_DATA initial{data, pitch, 0};
         ComPtr<ID3D11Texture2D> t;
         device->CreateTexture2D(&desc, data ? &initial : nullptr, &t);
         return t;
     };
-    std::vector<uint32_t> pixels(size_t{width} * height);
-    for (unsigned y = 0; y < height; ++y) {
-        for (unsigned x = 0; x < width; ++x) {
-            pixels[size_t{y} * width + x] = 0xFF000000u | ((x * 255 / width) << 16) | ((y * 255 / height) << 8) | ((x ^ y) & 0xFF);
-        }
-    }
+    constexpr double kPeriod = 7, kStep = 3, kPi = 3.14159265358979;
+    const auto stripes = [&](double u, int frame) { return 0.5 + 0.5 * std::sin(2 * kPi * (u - kStep * frame) / kPeriod); };
     const std::vector<float> depths(size_t{width} * height, 0.5f);
-    const std::vector<uint32_t> no_motion(size_t{width} * height, 0);  // R16G16_FLOAT zeros
-    const ComPtr<ID3D11Texture2D> colour = texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, pixels.data(), width * 4);
+    const std::vector<uint32_t> motion_data(size_t{width} * height, 0xC200u);  // R16G16_FLOAT (-3, 0): previous minus current
+    std::vector<uint32_t> pixels(size_t{width} * height);
+    const ComPtr<ID3D11Texture2D> colour = texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, nullptr, 0);
     const ComPtr<ID3D11Texture2D> depth = texture(width, height, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, depths.data(), width * 4);
-    const ComPtr<ID3D11Texture2D> motion = texture(width, height, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, no_motion.data(), width * 4);
-    const ComPtr<ID3D11Texture2D> output = texture(2560, 1440, DXGI_FORMAT_R8G8B8A8_UNORM,
+    const ComPtr<ID3D11Texture2D> motion = texture(width, height, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, motion_data.data(), width * 4);
+    const ComPtr<ID3D11Texture2D> output = texture(out_width, out_height, DXGI_FORMAT_R8G8B8A8_UNORM,
                                                    D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
-    if (!colour || !depth || !motion || !output) {
+    const ComPtr<ID3D11Texture2D> staging = texture(out_width, out_height, DXGI_FORMAT_R8G8B8A8_UNORM, 0, nullptr, 0,
+                                                    D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ);
+    if (!colour || !depth || !motion || !output || !staging) {
         std::printf("  %-11s textures could not be made\n", name);
         return;
     }
     if (dlss.feature) NVSDK_NGX_D3D11_ReleaseFeature(dlss.feature), dlss.feature = nullptr;
-    if (!dlss.make(context.Get(), mode, width, height, 2560, 1440)) return;
+    if (!dlss.make(context.Get(), mode, width, height, out_width, out_height, preset)) return;
     D3D11_QUERY_DESC query_desc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
     ComPtr<ID3D11Query> disjoint, start, stop;
     device->CreateQuery(&query_desc, &disjoint);
     query_desc.Query = D3D11_QUERY_TIMESTAMP;
     device->CreateQuery(&query_desc, &start);
     device->CreateQuery(&query_desc, &stop);
-    double total_ms = 0;
+    double total_ms = 0, error = 0;
     int timed = 0, failed = 0;
     constexpr int kFrames = 60;
     for (int frame = 0; frame < kFrames; ++frame) {
-        const Frame data{halton(frame % 16 + 1, 2) - 0.5f, halton(frame % 16 + 1, 3) - 0.5f, frame == 0, 1, 1,
-                         static_cast<uint32_t>(frame)};
+        const float jitter_x = halton(frame % 16 + 1, 2) - 0.5f, jitter_y = halton(frame % 16 + 1, 3) - 0.5f;
+        for (unsigned x = 0; x < width; ++x) {
+            const auto v = static_cast<uint32_t>(std::lround(stripes(x + 0.5 - jitter_x, frame) * 255));  // DLSS's jitter: pixel x shows the scene at x + 0.5 - jitter
+            pixels[x] = 0xFF000000u | (v << 16) | (v << 8) | v;
+        }
+        for (unsigned y = 1; y < height; ++y) std::copy_n(pixels.begin(), width, pixels.begin() + size_t{y} * width);
+        context->UpdateSubresource(colour.Get(), 0, nullptr, pixels.data(), width * 4, 0);
+        const Frame data{jitter_x, jitter_y, frame == 0, 1, 1, static_cast<uint32_t>(frame)};
         context->Begin(disjoint.Get());
         context->End(start.Get());
         if (!dlss.run(context.Get(), colour.Get(), depth.Get(), motion.Get(), output.Get(), width, height, data)) ++failed;
@@ -263,9 +278,20 @@ void bench_dlss(ID3D11Device* device, Dlss& dlss, NVSDK_NGX_PerfQuality_Value mo
             total_ms += (t1 - t0) * 1000.0 / clock.Frequency;
             ++timed;
         }
+        if (frame == kFrames - 1) {
+            context->CopyResource(staging.Get(), output.Get());
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(mapped.pData) + mapped.RowPitch * (out_height / 2));
+                for (unsigned x = 32; x < out_width - 32; ++x) {
+                    error += std::abs(double(row[x] & 0xFF) - stripes((x + 0.5) * width / out_width, frame) * 255) / (out_width - 64);
+                }
+                context->Unmap(staging.Get(), 0);
+            }
+        }
     }
-    std::printf("  %-11s %ux%u -> 2560x1440: %.2f ms a frame on the GPU (%d frames, %d failed)\n", name, width, height,
-                timed ? total_ms / timed : 0.0, timed, failed);
+    std::printf("  %-11s preset %-7s %4ux%-4u -> %ux%u: %5.2f ms on the GPU, error %4.1f of 255%s\n", name, preset_name, width,
+                height, out_width, out_height, timed ? total_ms / timed : 0.0, error, failed ? " (some frames failed)" : "");
 }
 
 // upscale64 --probe: whether DLSS Super Resolution runs on the high-performance graphics card (NGX on Direct3D 11),
@@ -302,13 +328,25 @@ int probe_dlss() {
     std::printf("DLSS Super Resolution: %s\n", available ? "available" : "not available");
     if (needs_driver) std::printf("a newer driver is needed: %u.%u or later\n", driver_major, driver_minor);
     if (available) {
-        for (const auto& m : kModes) {
-            unsigned int width = 0, height = 0, max_width = 0, max_height = 0, min_width = 0, min_height = 0;
-            float sharpness = 0;
-            if (NVSDK_NGX_SUCCEED(NGX_DLSS_GET_OPTIMAL_SETTINGS(dlss.parameters, 2560, 1440, m.value, &width, &height,
-                                                                &max_width, &max_height, &min_width, &min_height, &sharpness))) {
-                std::printf("  %-11s 2560x1440 from %ux%u\n", m.title, width, height);
-                if (m.value != NVSDK_NGX_PerfQuality_Value_Balanced) bench_dlss(device.Get(), dlss, m.value, m.title, width, height);
+        // Each mode with its default preset (0) and the transformer ones the SDK names (K, the default of DLAA, Quality
+        // and Balanced; M, of Performance; J, an older K; L, of Ultra Performance), at 1920x1080 and 2560x1440.
+        const struct {
+            const char* name;
+            unsigned value;
+        } presets[] = {{"default", 0}, {"J", NVSDK_NGX_DLSS_Hint_Render_Preset_J}, {"K", NVSDK_NGX_DLSS_Hint_Render_Preset_K},
+                       {"L", NVSDK_NGX_DLSS_Hint_Render_Preset_L}, {"M", NVSDK_NGX_DLSS_Hint_Render_Preset_M}};
+        for (const auto [out_width, out_height] : {std::pair{1920u, 1080u}, std::pair{2560u, 1440u}}) {
+            for (const auto& m : kModes) {
+                if (m.value == NVSDK_NGX_PerfQuality_Value_Balanced) continue;
+                unsigned int width = 0, height = 0, max_width = 0, max_height = 0, min_width = 0, min_height = 0;
+                float sharpness = 0;
+                if (NVSDK_NGX_FAILED(NGX_DLSS_GET_OPTIMAL_SETTINGS(dlss.parameters, out_width, out_height, m.value, &width, &height,
+                                                                   &max_width, &max_height, &min_width, &min_height, &sharpness))) {
+                    continue;
+                }
+                for (const auto& preset : presets) {
+                    bench_dlss(device.Get(), dlss, m.value, m.title, preset.name, preset.value, width, height, out_width, out_height);
+                }
             }
         }
     }
