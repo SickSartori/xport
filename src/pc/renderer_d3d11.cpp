@@ -1028,8 +1028,13 @@ std::unordered_set<uint32_t> g_shown_surfaces;  // surfaces renderer_present has
 struct SceneState {
     bool drawn = false;
     bool occluded = false;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // the rectangle its depth clear covered (a split-screen view), guest pixels
 };
 std::unordered_map<uint32_t, SceneState> g_scenes;
+// Shown surfaces whose scene already has the effects (bloom, colour, vignette) from the end of the 3D scene, under the
+// HUD: presenting them again (the same frame shown twice) must not add them a second time. Forgotten when the
+// surface is cleared.
+std::unordered_set<uint32_t> g_graded_surfaces;
 uint32_t g_occlusion_scenes = 0, g_full_depth_clears = 0;  // for the log: every scene should get its pass
 
 // The render thread (see "the render thread" below): draws and clears are queued by the thread that decodes the game's commands and
@@ -2015,29 +2020,36 @@ void ensure_swap_chain_size() {
     }
 }
 
-// --- modern effects, applied to the finished frame when it is presented ---
+// --- modern effects ---
 //
-// Bloom: the bright parts at a quarter of the frame's size, blurred (horizontal then vertical Gaussian) and added.
-// The final pass then sharpens (contrast-adaptive, like AMD CAS), adds the bloom, sets contrast and saturation and
-// darkens the corners a little. Settings in <port>.ini; F10 switches the effects off and on to compare.
+// Bloom: the bright parts (a soft threshold) at a quarter and an eighth of the frame's size, each blurred
+// (horizontal then vertical Gaussian): a narrow and a wide glow, laid over the picture as light is (screen blend: it
+// brightens without going past white). Contrast is an S curve around mid grey that keeps black black and white white
+// (a straight line clipped the highlights and crushed the night's dark parts), then saturation, then the corners a
+// little darker. All this at the end of the 3D scene, before the HUD is drawn over it (apply_scene_effects), so the
+// HUD keeps its own colours; a frame without a 3D scene (films, menus) gets it when it is presented. Sharpening
+// (contrast-adaptive, like AMD CAS) is always at present. Settings in <port>.ini; F10 switches the effects off and
+// on to compare.
 
 struct PostConstants {
     float source_texel[2];  // 1 / size of the texture read
     float output_texel[2];  // 1 / size of the frame's rectangle in the window
     float sharpen, bloom, bloom_threshold, saturation;
     float contrast, vignette, direction_x, direction_y;  // blur direction (in source texels)
+    float grade, unused[3];  // 1: bloom, contrast, saturation and vignette; 0: sharpening only (graded at scene end)
 };
 
 ComPtr<ID3D11Buffer> g_post_constants;
 ComPtr<ID3D11PixelShader> g_bright_pixel_shader, g_blur_pixel_shader, g_final_pixel_shader;
-ComPtr<ID3D11Texture2D> g_bloom_texture[2];
-ComPtr<ID3D11RenderTargetView> g_bloom_rtv[2];
-ComPtr<ID3D11ShaderResourceView> g_bloom_srv[2];
+ComPtr<ID3D11Texture2D> g_bloom_texture[4];  // a quarter of the frame (0, 1) and an eighth (2, 3)
+ComPtr<ID3D11RenderTargetView> g_bloom_rtv[4];
+ComPtr<ID3D11ShaderResourceView> g_bloom_srv[4];
+ComPtr<ID3D11BlendState> g_colour_only_blend;  // writes red, green and blue: the frame's alpha is the HUD's mask
 uint32_t g_bloom_width = 0, g_bloom_height = 0;
 
 constexpr char kBrightPixelShader[] = R"(
 cbuffer Post : register(b0) { float2 source_texel; float2 output_texel; float sharpen, bloom, threshold, saturation;
-                              float contrast, vignette; float2 direction; };
+                              float contrast, vignette; float2 direction; float grade; float3 unused; };
 Texture2D frame : register(t0);
 SamplerState filtered : register(s0);
 float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
@@ -2048,15 +2060,18 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         sum += frame.SampleLevel(filtered, uv + offset, 0).rgb;
     }
     const float3 colour = sum / 4;
+    // A soft threshold: from (threshold - knee) the bright part grows smoothly instead of starting with a step.
     const float brightness = max(colour.r, max(colour.g, colour.b));
-    const float weight = saturate((brightness - threshold) / max(1 - threshold, 0.01));
-    return float4(colour * weight, 1);
+    const float knee = 0.15;
+    const float soft = clamp(brightness - threshold + knee, 0, 2 * knee);
+    const float bright = max(soft * soft / (4 * knee), brightness - threshold);
+    return float4(colour * saturate(bright / max(brightness, 1e-4) / max(1 - threshold, 0.05)), 1);
 }
 )";
 
 constexpr char kBlurPixelShader[] = R"(
 cbuffer Post : register(b0) { float2 source_texel; float2 output_texel; float sharpen, bloom, threshold, saturation;
-                              float contrast, vignette; float2 direction; };
+                              float contrast, vignette; float2 direction; float grade; float3 unused; };
 Texture2D source : register(t0);
 SamplerState filtered : register(s0);
 float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
@@ -2075,10 +2090,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 
 constexpr char kFinalPixelShader[] = R"(
 cbuffer Post : register(b0) { float2 source_texel; float2 output_texel; float sharpen, bloom, threshold, saturation;
-                              float contrast, vignette; float2 direction; };
+                              float contrast, vignette; float2 direction; float grade; float3 unused; };
 Texture2D frame : register(t0);
 Texture2D glow : register(t1);
 SamplerState filtered : register(s0);
+Texture2D wide_glow : register(t2);
 float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float3 c = frame.SampleLevel(filtered, uv, 0).rgb;
     if (sharpen > 0) {
@@ -2094,24 +2110,29 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         const float3 weight = amplitude * peak;
         c = saturate((c + (n + s + w + e) * weight) / (1 + 4 * weight));
     }
-    c += glow.SampleLevel(filtered, uv, 0).rgb * bloom;
-    c = (c - 0.5) * contrast + 0.5;
-    const float luma = dot(c, float3(0.299, 0.587, 0.114));
-    c = lerp(luma.xxx, c, saturation);
-    const float2 centred = uv - 0.5;
-    c *= 1 - vignette * smoothstep(0.2, 0.75, dot(centred, centred) * 2);
+    if (grade > 0) {
+        const float3 light = (glow.SampleLevel(filtered, uv, 0).rgb + wide_glow.SampleLevel(filtered, uv, 0).rgb) * 0.5;
+        c = 1 - (1 - saturate(c)) * (1 - saturate(light * bloom));  // screen: light added, never past white
+        // Contrast as a curve through mid grey with that slope there, flattening towards black and white.
+        const float3 up = pow(c, contrast), down = pow(1 - c, contrast);
+        c = up / max(up + down, 1e-5);
+        const float luma = dot(c, float3(0.299, 0.587, 0.114));
+        c = lerp(luma.xxx, c, saturation);
+        const float2 centred = uv - 0.5;
+        c *= 1 - vignette * smoothstep(0.2, 0.75, dot(centred, centred) * 2);
+    }
     return float4(saturate(c), 1);
 }
 )";
 
 void ensure_bloom_targets(uint32_t width, uint32_t height) {
     const ForgetBound forget;
-    width = std::max(1u, width / 4), height = std::max(1u, height / 4);
+    width = std::max(2u, width / 4), height = std::max(2u, height / 4);
     if (g_bloom_texture[0] && g_bloom_width == width && g_bloom_height == height) return;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 4; ++i) {
         D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = width;
-        desc.Height = height;
+        desc.Width = i < 2 ? width : width / 2;
+        desc.Height = i < 2 ? height : height / 2;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
@@ -2129,16 +2150,20 @@ void ensure_bloom_targets(uint32_t width, uint32_t height) {
 }
 
 // One full-surface pass into `rtv` (viewport `area`) reading `sources`.
+// `blend` and `clip` (a scissor inside `area`) are optional.
 void post_pass(ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& area, ID3D11PixelShader* shader,
-               ID3D11ShaderResourceView* const* sources, UINT source_count, const PostConstants& constants) {
+               ID3D11ShaderResourceView* const* sources, UINT source_count, const PostConstants& constants,
+               ID3D11BlendState* blend = nullptr, const D3D11_RECT* clip = nullptr) {
     const ForgetBound forget;
     g_context->UpdateSubresource(g_post_constants.Get(), 0, nullptr, &constants, 0, 0);
     g_context->OMSetRenderTargets(1, &rtv, nullptr);
-    g_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g_context->OMSetBlendState(blend, nullptr, 0xFFFFFFFF);
     g_context->OMSetDepthStencilState(nullptr, 0);
     g_context->RSSetViewports(1, &area);
-    const D3D11_RECT scissor{static_cast<LONG>(area.TopLeftX), static_cast<LONG>(area.TopLeftY),
-                             static_cast<LONG>(area.TopLeftX + area.Width), static_cast<LONG>(area.TopLeftY + area.Height)};
+    const D3D11_RECT scissor = clip ? *clip
+                                    : D3D11_RECT{static_cast<LONG>(area.TopLeftX), static_cast<LONG>(area.TopLeftY),
+                                                 static_cast<LONG>(area.TopLeftX + area.Width),
+                                                 static_cast<LONG>(area.TopLeftY + area.Height)};
     g_context->RSSetScissorRects(1, &scissor);
     g_context->RSSetState(g_rasterizer.Get());
     g_context->IASetInputLayout(nullptr);
@@ -2151,13 +2176,75 @@ void post_pass(ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& area, ID3D11Pi
     ID3D11SamplerState* sampler = g_present_sampler.Get();
     g_context->PSSetSamplers(0, 1, &sampler);
     g_context->Draw(3, 0);
-    ID3D11ShaderResourceView* none[2] = {};
-    g_context->PSSetShaderResources(0, 2, none);
+    ID3D11ShaderResourceView* none[3] = {};
+    g_context->PSSetShaderResources(0, 3, none);
+}
+
+// The two glows of `frame` (bloom setting > 0): into g_bloom_srv[0] (a quarter, narrow) and [3] (an eighth, wide).
+void make_glow(ID3D11ShaderResourceView* frame, uint32_t frame_width, uint32_t frame_height, PostConstants constants) {
+    ensure_bloom_targets(frame_width, frame_height);
+    const D3D11_VIEWPORT quarter{0, 0, static_cast<float>(g_bloom_width), static_cast<float>(g_bloom_height), 0, 1};
+    const D3D11_VIEWPORT eighth{0, 0, static_cast<float>(g_bloom_width / 2), static_cast<float>(g_bloom_height / 2), 0, 1};
+    constants.source_texel[0] = 1.0f / frame_width, constants.source_texel[1] = 1.0f / frame_height;
+    post_pass(g_bloom_rtv[0].Get(), quarter, g_bright_pixel_shader.Get(), &frame, 1, constants);
+    constants.source_texel[0] = 1.0f / g_bloom_width, constants.source_texel[1] = 1.0f / g_bloom_height;
+    ID3D11ShaderResourceView* source = g_bloom_srv[0].Get();
+    constants.direction_x = 1, constants.direction_y = 0;
+    post_pass(g_bloom_rtv[1].Get(), quarter, g_blur_pixel_shader.Get(), &source, 1, constants);
+    source = g_bloom_srv[1].Get();
+    constants.direction_x = 0, constants.direction_y = 1;
+    post_pass(g_bloom_rtv[0].Get(), quarter, g_blur_pixel_shader.Get(), &source, 1, constants);
+    // The wide one: the narrow glow, blurred again at half its size with steps twice as long.
+    source = g_bloom_srv[0].Get();
+    constants.direction_x = 2, constants.direction_y = 0;
+    post_pass(g_bloom_rtv[2].Get(), eighth, g_blur_pixel_shader.Get(), &source, 1, constants);
+    constants.source_texel[0] = 2.0f / g_bloom_width, constants.source_texel[1] = 2.0f / g_bloom_height;
+    source = g_bloom_srv[2].Get();
+    constants.direction_x = 0, constants.direction_y = 2;
+    post_pass(g_bloom_rtv[3].Get(), eighth, g_blur_pixel_shader.Get(), &source, 1, constants);
+}
+
+PostConstants effect_settings() {
+    PostConstants constants{};
+    constants.sharpen = setting("sharpen");
+    constants.bloom = setting("bloom");
+    constants.bloom_threshold = setting("bloom_threshold");
+    constants.saturation = setting("saturation");
+    constants.contrast = std::max(0.1f, setting("contrast"));
+    constants.vignette = setting("vignette");
+    constants.grade = 1;
+    return constants;
+}
+
+ID3D11ShaderResourceView* target_copy(const Target& target);  // below, with the draws
+
+// At the end of a shown surface's 3D scene, under the HUD: bloom, contrast, saturation and vignette, within the
+// scene's rectangle (a split-screen view gets them once, when its own scene ends). Alpha is left as it is.
+void apply_scene_effects(Target& target, const SceneState& scene, uint32_t address) {
+    const ForgetBound forget;
+    if (!g_effects_enabled || !g_final_pixel_shader || !g_colour_only_blend) return;
+    D3D11_TEXTURE2D_DESC desc{};
+    target.texture->GetDesc(&desc);
+    ID3D11ShaderResourceView* copy = target_copy(target);
+    if (!copy) return;
+    PostConstants constants = effect_settings();
+    constants.sharpen = 0;  // at present, over the HUD too
+    if (constants.bloom > 0) make_glow(copy, desc.Width, desc.Height, constants);
+    ID3D11ShaderResourceView* sources[3] = {copy, constants.bloom > 0 ? g_bloom_srv[0].Get() : nullptr,
+                                            constants.bloom > 0 ? g_bloom_srv[3].Get() : nullptr};
+    const D3D11_VIEWPORT whole{0, 0, static_cast<float>(desc.Width), static_cast<float>(desc.Height), 0, 1};
+    D3D11_RECT clip{scaled(scene.x0), scaled(scene.y0), scaled(scene.x1), scaled(scene.y1)};
+    if (clip.right <= clip.left || clip.bottom <= clip.top) {
+        clip = D3D11_RECT{0, 0, static_cast<LONG>(desc.Width), static_cast<LONG>(desc.Height)};
+    }
+    constants.output_texel[0] = 1.0f / desc.Width, constants.output_texel[1] = 1.0f / desc.Height;
+    post_pass(target.rtv.Get(), whole, g_final_pixel_shader.Get(), sources, 3, constants, g_colour_only_blend.Get(), &clip);
+    g_graded_surfaces.insert(address);
 }
 
 // Draws the frame into the window: the largest rectangle of the picture's shape (renderer_aspect) that fits,
 // centred, filtered, with the effects.
-void present_frame(ID3D11ShaderResourceView* frame, uint32_t frame_width, uint32_t frame_height) {
+void present_frame(ID3D11ShaderResourceView* frame, uint32_t frame_width, uint32_t frame_height, bool graded) {
     const ForgetBound forget;
     if (!g_final_rtv || !g_present_pixel_shader) return;
     if (g_effects_enabled && g_final_pixel_shader && frame_width && frame_height) {
@@ -2170,33 +2257,16 @@ void present_frame(ID3D11ShaderResourceView* frame, uint32_t frame_width, uint32
         }
         const D3D11_VIEWPORT area{std::floor((g_swap_width - width) / 2), std::floor((g_swap_height - height) / 2),
                                   width, height, 0, 1};
-        PostConstants constants{};
-        constants.sharpen = setting("sharpen");
-        constants.bloom = setting("bloom");
-        constants.bloom_threshold = setting("bloom_threshold");
-        constants.saturation = setting("saturation");
-        constants.contrast = setting("contrast");
-        constants.vignette = setting("vignette");
-        ID3D11ShaderResourceView* glow = nullptr;
-        if (constants.bloom > 0) {
-            ensure_bloom_targets(frame_width, frame_height);
-            const D3D11_VIEWPORT quarter{0, 0, static_cast<float>(g_bloom_width), static_cast<float>(g_bloom_height), 0, 1};
-            constants.source_texel[0] = 1.0f / frame_width, constants.source_texel[1] = 1.0f / frame_height;
-            post_pass(g_bloom_rtv[0].Get(), quarter, g_bright_pixel_shader.Get(), &frame, 1, constants);
-            constants.source_texel[0] = 1.0f / g_bloom_width, constants.source_texel[1] = 1.0f / g_bloom_height;
-            constants.direction_x = 1, constants.direction_y = 0;
-            ID3D11ShaderResourceView* first = g_bloom_srv[0].Get();
-            post_pass(g_bloom_rtv[1].Get(), quarter, g_blur_pixel_shader.Get(), &first, 1, constants);
-            constants.direction_x = 0, constants.direction_y = 1;
-            ID3D11ShaderResourceView* second = g_bloom_srv[1].Get();
-            post_pass(g_bloom_rtv[0].Get(), quarter, g_blur_pixel_shader.Get(), &second, 1, constants);
-            glow = g_bloom_srv[0].Get();
-        }
+        PostConstants constants = effect_settings();
+        if (graded) constants.grade = 0;  // the scene has them already, under the HUD
+        const bool glow = constants.grade > 0 && constants.bloom > 0;
+        if (glow) make_glow(frame, frame_width, frame_height, constants);
         const float black[4] = {0, 0, 0, 1};
         g_context->ClearRenderTargetView(g_final_rtv.Get(), black);
         constants.output_texel[0] = 1.0f / width, constants.output_texel[1] = 1.0f / height;
-        ID3D11ShaderResourceView* sources[2] = {frame, glow};
-        post_pass(g_final_rtv.Get(), area, g_final_pixel_shader.Get(), sources, 2, constants);
+        ID3D11ShaderResourceView* sources[3] = {frame, glow ? g_bloom_srv[0].Get() : nullptr,
+                                                glow ? g_bloom_srv[3].Get() : nullptr};
+        post_pass(g_final_rtv.Get(), area, g_final_pixel_shader.Get(), sources, 3, constants);
         return;
     }
     const float aspect = g_shown_aspect > 0 ? g_shown_aspect : renderer_aspect();
@@ -2598,6 +2668,10 @@ bool renderer_start(HWND window) {
     multiply.RenderTarget[0].RenderTargetWriteMask =
         D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
     g_device->CreateBlendState(&multiply, &g_multiply_blend);
+    D3D11_BLEND_DESC colour_only{};
+    colour_only.RenderTarget[0].RenderTargetWriteMask =
+        D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+    g_device->CreateBlendState(&colour_only, &g_colour_only_blend);
     D3D11_BUFFER_DESC post_constants{};
     post_constants.ByteWidth = sizeof(PostConstants);
     post_constants.Usage = D3D11_USAGE_DEFAULT;
@@ -2697,9 +2771,12 @@ void clear_now(const SurfaceState& surface, uint32_t flags, uint32_t color, uint
     // (256x256, 512x512 reflections) in the middle of a frame; those must not restart the scene, or the occlusion
     // was skipped in some frames and flickered.
     if ((flags & 0x1) && surface.zeta_address && surface.width >= 640) {
-        g_scenes[surface.zeta_address] = SceneState{};
+        SceneState scene{};
+        scene.x0 = x0, scene.y0 = y0, scene.x1 = x1 + 1, scene.y1 = y1 + 1;
+        g_scenes[surface.zeta_address] = scene;
         ++g_full_depth_clears;
     }
+    if (channels == 0xF || (flags & 0x1)) g_graded_surfaces.erase(surface.color_address);  // a new picture starts
     if ((flags & 0x3) && surface.zeta_address) {
         // The depth buffer has its colour target's size (D3D11 requires it when both are bound).
         if (DepthTarget* depth = get_depth_target(surface.zeta_address, target->width, target->height)) {
@@ -2758,6 +2835,7 @@ bool prepare_draw(const SurfaceState& surface, const DrawState& state, PreparedD
                 apply_occlusion(*target, *scene_depth);
                 ++g_occlusion_scenes;
             }
+            if (g_shown_surfaces.count(surface.color_address)) apply_scene_effects(*target, scene, surface.color_address);
         }
     }
     draw = PreparedDraw{target, depth, shader};
@@ -3768,7 +3846,8 @@ void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_
     const uint64_t effects_start = ticks();
     std::unique_lock<std::mutex> drawing(g_present_mutex);
     if (g_final_lock) g_final_lock->AcquireSync(0, INFINITE);
-    present_frame(frame_view, frame_desc.Width, frame_desc.Height);
+    present_frame(frame_view, frame_desc.Width, frame_desc.Height,
+                  target != g_targets.end() && g_graded_surfaces.count(address) != 0);
     renderer_game_frame_shown();
     ++g_presented;
     g_compile_waited_ms = 0;
