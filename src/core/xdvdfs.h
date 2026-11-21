@@ -41,6 +41,10 @@ public:
     size_t read(const Entry& file, uint64_t offset, void* destination, size_t size) const;
     std::vector<uint8_t> read_all(const Entry& file) const;
 
+    // The name of a file or directory that lies past the image's end, if there is one: the image is incomplete
+    // (a download cut short), and the game would find that entry missing or unreadable and crash much later.
+    std::optional<std::string> entry_past_end() const;
+
 private:
     // One file of the image: its bytes from `start` of the whole image on, `size` of them. A CCI part keeps the
     // position of each 2048-byte sector (`sectors`, one more for the end), compressed with LZ4 where flagged.

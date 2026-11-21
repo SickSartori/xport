@@ -244,6 +244,21 @@ std::vector<uint8_t> XdvdfsImage::read_all(const Entry& file) const {
     return data;
 }
 
+std::optional<std::string> XdvdfsImage::entry_past_end() const {
+    std::vector<Entry> pending{root_};
+    // The count bounds a damaged image whose directories point at each other (a game disc has a few thousand entries).
+    for (int seen = 0; !pending.empty() && seen < 100000;) {
+        const Entry directory = std::move(pending.back());
+        pending.pop_back();
+        for (Entry& entry : list(directory)) {
+            ++seen;
+            if (!within_image(entry)) return entry.name;
+            if (entry.is_directory) pending.push_back(std::move(entry));
+        }
+    }
+    return std::nullopt;
+}
+
 bool XdvdfsImage::read_raw(uint64_t offset, void* destination, size_t size) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto* out = static_cast<uint8_t*>(destination);
