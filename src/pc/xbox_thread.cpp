@@ -291,6 +291,22 @@ unsigned long gpu_cores() {
     return static_cast<unsigned long>(mask ? mask : others);
 }
 
+// Left to Windows inside one mask, MC3 in a city at 120 fps (i7-1360P) had whole 10 s windows at 85 fps, Direct3D at
+// 7 microseconds a draw instead of 3, where a core each held 119.5; why was not found (both forced onto one core was
+// not slow that way). It did not come back in later runs, and no run was slower with a core each.
+GpuCoreSplit gpu_core_split() {
+    const DWORD_PTR mask = gpu_cores();
+    std::vector<DWORD_PTR> cores;
+    for (const Core& core : processor_cores()) {
+        if (const DWORD_PTR in = core.mask & mask) cores.push_back(in);
+    }
+    if (cores.size() < 2) return {};
+    GpuCoreSplit split;
+    split.render = static_cast<unsigned long>(cores[0]);
+    split.gpu = static_cast<unsigned long>(mask & ~cores[0]);
+    return split;
+}
+
 void run_at_full_speed() {
     // Windows slows the threads of a window that is not in front, or of any program on battery saver, by moving them
     // to the slow cores at a low clock (EcoQoS). A game that keeps running in the background says no.

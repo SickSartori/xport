@@ -3480,8 +3480,12 @@ void run_queued_draw(const QueuedHeader* header) {
     }
 }
 
+unsigned long g_render_cores = 0;  // set by start_render_thread
+
 void render_thread() {
-    if (const unsigned long cores = gpu_cores()) SetThreadAffinityMask(GetCurrentThread(), cores);
+    if (const unsigned long cores = g_render_cores ? g_render_cores : gpu_cores()) {
+        SetThreadAffinityMask(GetCurrentThread(), cores);
+    }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     profile_name_thread(false, "render");
     g_render_thread_id = GetCurrentThreadId();
@@ -3555,10 +3559,18 @@ void start_render_thread() {
         return;
     }
     g_queue_alternates = wanted == 2;
+    // Called on the GPU thread: it and the render thread each on cores of their own.
+    const GpuCoreSplit split = gpu_core_split();
+    if (split.render) {
+        SetThreadAffinityMask(GetCurrentThread(), split.gpu);
+        g_render_cores = split.render;
+    }
     std::thread(render_thread).detach();
     while (!g_render_thread_id) Sleep(0);
     g_queue_on = true;
-    log_line("renderer: draws and clears on a render thread");
+    log_line("renderer: draws and clears on a render thread (id %lu, mask %08lX), the GPU thread (id %lu) on mask %08lX",
+             g_render_thread_id, split.render ? split.render : gpu_cores(), GetCurrentThreadId(),
+             split.gpu ? split.gpu : gpu_cores());
 }
 
 }  // namespace

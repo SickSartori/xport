@@ -102,6 +102,12 @@ unsigned long emulation_cores();
 // emulation_cores(), leaving out the twin (SMT) of the game's core, which would share one core's speed with the game.
 unsigned long fastest_cores();
 unsigned long gpu_cores();
+// gpu_cores() shared by the GPU thread and the render thread (renderer_d3d11.cpp) on different physical cores: the
+// render thread's is the first of them, the GPU thread keeps the others. Both 0 with fewer than two such cores.
+struct GpuCoreSplit {
+    unsigned long gpu = 0, render = 0;
+};
+GpuCoreSplit gpu_core_split();
 
 // The process keeps its full speed in the background and on battery saver (no EcoQoS).
 void run_at_full_speed();
