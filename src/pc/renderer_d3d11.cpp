@@ -1980,6 +1980,39 @@ bool share_with_present_device(ID3D11Texture2D* texture, ComPtr<ID3D11Texture2D>
            SUCCEEDED(texture->QueryInterface(IID_PPV_ARGS(&game_lock))) && SUCCEEDED(opened.As(&present_lock));
 }
 
+// The sharing calls can all succeed while the picture never reaches the other device (DXVK answers S_OK to a lock it
+// does not have): the window would stop changing. A colour cleared on the game's device is read back on the present
+// device, with the locks taken as a frame takes them.
+bool shared_picture_arrives(ID3D11Texture2D* texture, ID3D11Texture2D* opened, IDXGIKeyedMutex* game_lock,
+                            IDXGIKeyedMutex* present_lock) {
+    constexpr DWORD kWaitMs = 1000;  // never INFINITE here: a lock that is not handed over must not hang the start
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(g_device->CreateRenderTargetView(texture, nullptr, &rtv)) || game_lock->AcquireSync(0, kWaitMs) != S_OK) {
+        return false;
+    }
+    const float colour[4] = {0.2f, 0.4f, 0.6f, 1.0f};
+    g_context->ClearRenderTargetView(rtv.Get(), colour);
+    game_lock->ReleaseSync(0);
+    D3D11_TEXTURE2D_DESC desc{};
+    opened->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = desc.MiscFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(g_present_device->CreateTexture2D(&desc, nullptr, &staging)) ||
+        present_lock->AcquireSync(0, kWaitMs) != S_OK) {
+        return false;
+    }
+    g_present_context->CopyResource(staging.Get(), opened);
+    present_lock->ReleaseSync(0);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(g_present_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+    const auto* pixel = static_cast<const uint8_t*>(mapped.pData);  // blue, green, red: the colour above in bytes
+    const bool same = std::abs(pixel[0] - 153) <= 2 && std::abs(pixel[1] - 102) <= 2 && std::abs(pixel[2] - 51) <= 2;
+    g_present_context->Unmap(staging.Get(), 0);
+    return same;
+}
+
 // The swap chain follows the window's client area (it changes with resizing and full screen).
 void ensure_swap_chain_size() {
     const ForgetBound forget;
@@ -2650,6 +2683,10 @@ bool renderer_start(HWND window) {
         ComPtr<IDXGIKeyedMutex> game_lock, present_lock;
         g_present_threaded = SUCCEEDED(g_device->CreateTexture2D(&probe_desc, nullptr, &probe)) &&
                              share_with_present_device(probe.Get(), opened, game_lock, present_lock);
+        if (g_present_threaded && !shared_picture_arrives(probe.Get(), opened.Get(), game_lock.Get(), present_lock.Get())) {
+            log_line("renderer: a picture shared with the second device does not arrive there");
+            g_present_threaded = false;
+        }
     }
     if (!g_present_threaded) {
         log_line("renderer: no second device for presenting, presenting on the GPU thread");
