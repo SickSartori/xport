@@ -11,7 +11,6 @@ It contains no game code or data. Each port reads everything it needs from the p
 
 Version: **0.2.0**. Licence: [MIT](LICENSE).
 
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub_Sponsors-support-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/SickSartori)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/sicksartori)
 
 ## Why it exists
@@ -149,8 +148,7 @@ The library's tests: `test_core` (discs, XBE), `test_log`, `test_texture_pages`,
 ## Supporting the project
 
 xport and the ports built on it are free and always will be. If they are useful to you and you want to say thanks, you
-can support their author on [GitHub Sponsors](https://github.com/sponsors/SickSartori) or
-[Ko-fi](https://ko-fi.com/sicksartori).
+can support their author on [Ko-fi](https://ko-fi.com/sicksartori).
 
 ## Licence
 
