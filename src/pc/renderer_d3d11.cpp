@@ -1391,7 +1391,9 @@ void refresh_write_tracking() {
 // textures_replace\<hash>.png (or .jpg) in the data folder: a picture drawn instead of the game's texture whose
 // bytes have that hash (16 hex digits, as <GAME>_DUMP_2D and <GAME>_DUMP_TEXTURE name their files), of any size. For
 // pictures made from one's own copy of the game, sharper or redrawn; <port> ships none. Linear textures (addressed
-// in texels) are left as they are.
+// in texels) are left as they are. For a texture with a palette, a PNG with a palette of its own (8 bits a pixel) is
+// taken as indices into the game's palette: the picture is larger, the colours stay the game's, as it changes them (a
+// HUD the player colours). <GAME>_DUMP_2D saves such a texture's indices and palette beside its picture.
 std::unordered_map<uint64_t, std::filesystem::path> g_replacements;
 
 void find_replacements() {
@@ -1409,8 +1411,10 @@ void find_replacements() {
     if (!g_replacements.empty()) log_line("renderer: %zu replacement textures", g_replacements.size());
 }
 
-// The picture `file` as BGRA, through Windows' image decoders (PNG, JPEG).
-bool load_picture(const std::filesystem::path& file, std::vector<uint8_t>& bgra, UINT& width, UINT& height) {
+// The picture `file` as BGRA, through Windows' image decoders (PNG, JPEG). With `palette` (256 BGRA entries) a picture
+// of 8 bits a pixel gives its indices, coloured from that palette instead of its own.
+bool load_picture(const std::filesystem::path& file, std::vector<uint8_t>& bgra, UINT& width, UINT& height,
+                  const uint8_t* palette = nullptr) {
     thread_local const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // the launcher's thread and the GPU's
     (void)com;
     ComPtr<IWICImagingFactory> factory;
@@ -1420,7 +1424,19 @@ bool load_picture(const std::filesystem::path& file, std::vector<uint8_t>& bgra,
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) ||
         FAILED(factory->CreateDecoderFromFilename(file.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
                                                   &decoder)) ||
-        FAILED(decoder->GetFrame(0, &frame)) || FAILED(factory->CreateFormatConverter(&converter)) ||
+        FAILED(decoder->GetFrame(0, &frame))) {
+        return false;
+    }
+    WICPixelFormatGUID format{};
+    if (palette && SUCCEEDED(frame->GetPixelFormat(&format)) && IsEqualGUID(format, GUID_WICPixelFormat8bppIndexed)) {
+        if (FAILED(frame->GetSize(&width, &height)) || !width || !height || width > 8192 || height > 8192) return false;
+        std::vector<uint8_t> indices(static_cast<size_t>(width) * height);
+        if (FAILED(frame->CopyPixels(nullptr, width, static_cast<UINT>(indices.size()), indices.data()))) return false;
+        bgra.resize(indices.size() * 4);
+        for (size_t i = 0; i < indices.size(); ++i) std::memcpy(&bgra[i * 4], palette + indices[i] * 4, 4);
+        return true;
+    }
+    if (FAILED(factory->CreateFormatConverter(&converter)) ||
         FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0,
                                      WICBitmapPaletteTypeCustom)) ||
         FAILED(converter->GetSize(&width, &height)) || !width || !height || width > 8192 || height > 8192) {
@@ -1431,10 +1447,10 @@ bool load_picture(const std::filesystem::path& file, std::vector<uint8_t>& bgra,
 }
 
 // A replacement picture as a texture with its mip levels made by the graphics card.
-bool make_replacement(const std::filesystem::path& file, CachedTexture& cached) {
+bool make_replacement(const std::filesystem::path& file, CachedTexture& cached, const uint8_t* palette) {
     std::vector<uint8_t> bgra;
     UINT width = 0, height = 0;
-    if (!load_picture(file, bgra, width, height)) {
+    if (!load_picture(file, bgra, width, height, palette)) {
         log_line("renderer: cannot read the replacement texture %s", file.filename().string().c_str());
         return false;
     }
@@ -1605,7 +1621,7 @@ ID3D11ShaderResourceView* find_texture_view(const TextureStage& stage, bool flat
         const auto replacement = g_replacements.find(own_hash);
         if (replacement != g_replacements.end()) {
             cached = CachedTexture{};
-            if (make_replacement(replacement->second, cached)) {
+            if (make_replacement(replacement->second, cached, palette ? physical_pointer(palette) : nullptr)) {
                 cached.content_hash = hash;
                 log_line("renderer: texture %08X replaced by %s", d.address,
                          replacement->second.filename().string().c_str());
@@ -1680,6 +1696,17 @@ ID3D11ShaderResourceView* find_texture_view(const TextureStage& stage, bool flat
             std::fwrite(&header, sizeof(header), 1, file);
             std::fwrite(&info, sizeof(info), 1, file);
             std::fwrite(image.data.data(), 1, image.data.size(), file);
+            std::fclose(file);
+        }
+    }
+    if (dump && palette && physical_pointer(palette)) {  // for a replacement by indices: the texture's bytes as they
+                                                         // are (swizzled indices), then the 256 BGRA entries
+        char name[64];
+        std::snprintf(name, sizeof(name), "texture-%08X-%016llX.idx", d.address,
+                      static_cast<unsigned long long>(own_hash));
+        if (FILE* file = std::fopen(name, "wb")) {
+            std::fwrite(memory, 1, bytes, file);
+            std::fwrite(physical_pointer(palette), 1, 1024, file);
             std::fclose(file);
         }
     }
