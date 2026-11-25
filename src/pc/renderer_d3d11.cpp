@@ -2090,14 +2090,16 @@ void ensure_swap_chain_size() {
 // little darker. All this at the end of the 3D scene, before the HUD is drawn over it (apply_scene_effects), so the
 // HUD keeps its own colours; a frame without a 3D scene (films, menus) gets it when it is presented. Sharpening
 // (contrast-adaptive, like AMD CAS) is always at present. Settings in <port>.ini; F10 switches the effects off and
-// on to compare.
+// on to compare. The player's gamma and brightness (keys gamma and brightness) apply at the same point, to the 3D
+// scene only, with the effects on or off.
 
 struct PostConstants {
     float source_texel[2];  // 1 / size of the texture read
     float output_texel[2];  // 1 / size of the frame's rectangle in the window
     float sharpen, bloom, bloom_threshold, saturation;
     float contrast, vignette, direction_x, direction_y;  // blur direction (in source texels)
-    float grade, unused[3];  // 1: bloom, contrast, saturation and vignette; 0: sharpening only (graded at scene end)
+    float grade;  // 1: bloom, contrast, saturation and vignette; 0: sharpening only (graded at scene end)
+    float gamma, brightness, unused;  // the player's screen settings, 1 and 1 to leave the picture as it is
 };
 
 ComPtr<ID3D11Buffer> g_post_constants;
@@ -2110,7 +2112,7 @@ uint32_t g_bloom_width = 0, g_bloom_height = 0;
 
 constexpr char kBrightPixelShader[] = R"(
 cbuffer Post : register(b0) { float2 source_texel; float2 output_texel; float sharpen, bloom, threshold, saturation;
-                              float contrast, vignette; float2 direction; float grade; float3 unused; };
+                              float contrast, vignette; float2 direction; float grade, gamma, brightness, unused; };
 Texture2D frame : register(t0);
 SamplerState filtered : register(s0);
 float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
@@ -2132,7 +2134,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 
 constexpr char kBlurPixelShader[] = R"(
 cbuffer Post : register(b0) { float2 source_texel; float2 output_texel; float sharpen, bloom, threshold, saturation;
-                              float contrast, vignette; float2 direction; float grade; float3 unused; };
+                              float contrast, vignette; float2 direction; float grade, gamma, brightness, unused; };
 Texture2D source : register(t0);
 SamplerState filtered : register(s0);
 float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
@@ -2151,7 +2153,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 
 constexpr char kFinalPixelShader[] = R"(
 cbuffer Post : register(b0) { float2 source_texel; float2 output_texel; float sharpen, bloom, threshold, saturation;
-                              float contrast, vignette; float2 direction; float grade; float3 unused; };
+                              float contrast, vignette; float2 direction; float grade, gamma, brightness, unused; };
 Texture2D frame : register(t0);
 Texture2D glow : register(t1);
 SamplerState filtered : register(s0);
@@ -2181,6 +2183,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         c = lerp(luma.xxx, c, saturation);
         const float2 centred = uv - 0.5;
         c *= 1 - vignette * smoothstep(0.2, 0.75, dot(centred, centred) * 2);
+    }
+    if (gamma != 1 || brightness != 1) {
+        // Brightness above 1 lifts the dark parts towards white (white stays white), below 1 darkens everything;
+        // then gamma, more than 1 lighter in the middle tones, black and white where they are.
+        c = saturate(c);
+        c = brightness >= 1 ? 1 - (1 - c) * (2 - brightness) : c * brightness;
+        c = pow(c, 1 / gamma);
     }
     return float4(saturate(c), 1);
 }
@@ -2274,21 +2283,33 @@ PostConstants effect_settings() {
     constants.contrast = std::max(0.1f, setting("contrast"));
     constants.vignette = setting("vignette");
     constants.grade = 1;
+    // A port without these keys reads 0: the picture as it is.
+    const float gamma = setting("gamma"), brightness = setting("brightness") / 100;
+    constants.gamma = gamma > 0 ? std::clamp(gamma, 0.5f, 2.0f) : 1;
+    constants.brightness = brightness > 0 ? std::clamp(brightness, 0.5f, 1.5f) : 1;
     return constants;
 }
+
+// Gamma and brightness to apply, the modern effects on or off.
+bool screen_tone(const PostConstants& constants) { return constants.gamma != 1 || constants.brightness != 1; }
 
 ID3D11ShaderResourceView* target_copy(const Target& target);  // below, with the draws
 
 // At the end of a shown surface's 3D scene, under the HUD: bloom, contrast, saturation and vignette, within the
-// scene's rectangle (a split-screen view gets them once, when its own scene ends). Alpha is left as it is.
+// scene's rectangle (a split-screen view gets them once, when its own scene ends), and the player's gamma and
+// brightness, which apply with the modern effects off too. Alpha is left as it is.
 void apply_scene_effects(Target& target, const SceneState& scene, uint32_t address) {
     const ForgetBound forget;
-    if (!g_effects_enabled || !g_final_pixel_shader || !g_colour_only_blend) return;
+    if (!g_final_pixel_shader || !g_colour_only_blend) return;
+    PostConstants constants = effect_settings();
+    if (!g_effects_enabled) {
+        if (!screen_tone(constants)) return;
+        constants.grade = 0, constants.bloom = 0;  // gamma and brightness only
+    }
     D3D11_TEXTURE2D_DESC desc{};
     target.texture->GetDesc(&desc);
     ID3D11ShaderResourceView* copy = target_copy(target);
     if (!copy) return;
-    PostConstants constants = effect_settings();
     constants.sharpen = 0;  // at present, over the HUD too
     if (constants.bloom > 0) make_glow(copy, desc.Width, desc.Height, constants);
     ID3D11ShaderResourceView* sources[3] = {copy, constants.bloom > 0 ? g_bloom_srv[0].Get() : nullptr,
@@ -2300,7 +2321,7 @@ void apply_scene_effects(Target& target, const SceneState& scene, uint32_t addre
     }
     constants.output_texel[0] = 1.0f / desc.Width, constants.output_texel[1] = 1.0f / desc.Height;
     post_pass(target.rtv.Get(), whole, g_final_pixel_shader.Get(), sources, 3, constants, g_colour_only_blend.Get(), &clip);
-    g_graded_surfaces.insert(address);
+    if (g_effects_enabled) g_graded_surfaces.insert(address);
 }
 
 // --- DLSS, an experiment (<GAME>_DLSS=dlaa|quality|balanced|performance) ---
@@ -2467,6 +2488,7 @@ void present_frame(ID3D11ShaderResourceView* frame, uint32_t frame_width, uint32
                                   width, height, 0, 1};
         PostConstants constants = effect_settings();
         if (graded) constants.grade = 0;  // the scene has them already, under the HUD
+        constants.gamma = constants.brightness = 1;  // the 3D scene only (above), never films, menus or the HUD
         const bool glow = constants.grade > 0 && constants.bloom > 0;
         if (glow) make_glow(frame, frame_width, frame_height, constants);
         const float black[4] = {0, 0, 0, 1};
