@@ -12,5 +12,8 @@ bool gamepad_init();  // once per process; false when SDL cannot start (the keyb
 // noexcept like XInput's own, so the launcher's XInput pointers take them.
 DWORD WINAPI gamepad_get_state(DWORD slot, XINPUT_STATE* state) noexcept;  // ERROR_SUCCESS or ERROR_DEVICE_NOT_CONNECTED
 DWORD WINAPI gamepad_set_state(DWORD slot, XINPUT_VIBRATION* vibration) noexcept;
+// How strongly the controllers rumble, 0 (never) to 1 (as the game asks, the default): the port passes its setting at
+// start and when the player changes it. The motors running now follow at the game's next request.
+void gamepad_set_rumble_scale(float scale);
 
 }  // namespace xport::pc

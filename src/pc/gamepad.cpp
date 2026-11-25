@@ -16,6 +16,7 @@ constexpr DWORD kSlots = 4;
 
 std::mutex g_mutex;
 bool g_ready = false;
+float g_rumble_scale = 1;  // gamepad_set_rumble_scale, under g_mutex
 SDL_Gamepad* g_slots[kSlots] = {};
 
 // Closes the pads that went away and gives free slots to the pads that appeared.
@@ -116,8 +117,14 @@ DWORD WINAPI gamepad_set_state(DWORD slot, XINPUT_VIBRATION* vibration) noexcept
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_ready || slot >= kSlots || !g_slots[slot]) return ERROR_DEVICE_NOT_CONNECTED;
     // shortcut: XInput rumbles until told otherwise, SDL for at most 65 s; the game refreshes it far more often.
-    SDL_RumbleGamepad(g_slots[slot], vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed, 0xFFFF);
+    const auto scaled = [](WORD speed) { return static_cast<Uint16>(static_cast<float>(speed) * g_rumble_scale + 0.5f); };
+    SDL_RumbleGamepad(g_slots[slot], scaled(vibration->wLeftMotorSpeed), scaled(vibration->wRightMotorSpeed), 0xFFFF);
     return ERROR_SUCCESS;
+}
+
+void gamepad_set_rumble_scale(float scale) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_rumble_scale = std::clamp(scale, 0.0f, 1.0f);
 }
 
 }  // namespace xport::pc
