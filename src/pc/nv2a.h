@@ -43,6 +43,9 @@ uint32_t nv2a_frames_shown();
 int nv2a_vblank_hz();
 // Borderless full screen on the window's monitor, or back to the window.
 void nv2a_set_full_screen(bool full_screen);
+// Whether the window is in full screen now, however it got there (the setting, the menu, Alt+Enter or F11); before the
+// window exists, the setting.
+bool nv2a_full_screen();
 
 // Loads the window's icons from the game's exe's resources. Must run before the XBE is mapped over the exe's image,
 // which erases them.
