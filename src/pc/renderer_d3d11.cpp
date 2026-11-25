@@ -1395,9 +1395,9 @@ void refresh_write_tracking() {
 // taken as indices into the game's palette: the picture is larger, the colours stay the game's, as it changes them (a
 // HUD the player colours). <GAME>_DUMP_2D saves such a texture's indices and palette beside its picture.
 std::unordered_map<uint64_t, std::filesystem::path> g_replacements;
+std::string g_extra_replacements;  // renderer_replacement_folder
 
-void find_replacements() {
-    const std::filesystem::path folder = data_directory() / "textures_replace";
+void find_replacements_in(const std::filesystem::path& folder) {
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
         const std::wstring extension = entry.path().extension().wstring();
@@ -1408,6 +1408,11 @@ void find_replacements() {
         const uint64_t hash = std::wcstoull(stem.c_str(), &end, 16);
         if (end == stem.c_str() + 16) g_replacements[hash] = entry.path();
     }
+}
+
+void find_replacements() {
+    find_replacements_in(data_directory() / "textures_replace");
+    if (!g_extra_replacements.empty()) find_replacements_in(data_directory() / g_extra_replacements);
     if (!g_replacements.empty()) log_line("renderer: %zu replacement textures", g_replacements.size());
 }
 
@@ -3394,6 +3399,8 @@ void draw_vertex_data(const SurfaceState& surface, const DrawState& state, ID3D1
 }
 
 }  // namespace
+
+void renderer_replacement_folder(const char* name) { g_extra_replacements = name ? name : ""; }
 
 bool renderer_load_picture(const std::filesystem::path& file, std::vector<uint8_t>& bgra, UINT& width, UINT& height) {
     return load_picture(file, bgra, width, height);

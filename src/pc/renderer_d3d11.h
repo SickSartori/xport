@@ -131,6 +131,9 @@ void renderer_flush();
 void renderer_after_drawing(void (*call)(uint32_t, uint32_t), uint32_t first, uint32_t second);
 // Whether renderer_draw_fixed_function is available (shader compiled, buffers usable).
 bool renderer_has_fixed_function();
+// One more folder of replacement pictures (as textures_replace, in the data folder), read after it: its pictures win.
+// For a set the player picks in the settings (mc3port's redrawn original HUD). Call before the first frame.
+void renderer_replacement_folder(const char* name);
 // A PNG or JPEG as BGRA, on any thread (the launcher's logo too).
 bool renderer_load_picture(const std::filesystem::path& file, std::vector<uint8_t>& bgra, UINT& width, UINT& height);
 // The same draw with the fixed-function transform on the GPU: `vertex_data` holds the guest vertex bytes (4-byte
