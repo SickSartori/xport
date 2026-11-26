@@ -131,7 +131,8 @@ void renderer_flush();
 void renderer_after_drawing(void (*call)(uint32_t, uint32_t), uint32_t first, uint32_t second);
 // Whether renderer_draw_fixed_function is available (shader compiled, buffers usable).
 bool renderer_has_fixed_function();
-// One more folder of replacement pictures (as textures_replace, in the data folder), read after it: its pictures win.
+// One more folder of replacement pictures, read after textures_replace (its pictures win): beside the exe (a set the
+// port ships), then in the data folder (the player's own, over those).
 // For a set the player picks in the settings (mc3port's redrawn original HUD). Call before the first frame.
 void renderer_replacement_folder(const char* name);
 // A PNG or JPEG as BGRA, on any thread (the launcher's logo too).
