@@ -69,6 +69,11 @@ struct DrawState {
     // A flat draw's extent on the surface in pixels, worked out on the CPU (left > right when not): sharp_2d enlarges
     // the textures of such draws, and a game may narrow them (renderer_game_narrowing: MC3's HUD in 16:9).
     float screen_left, screen_right, screen_top, screen_bottom;
+    // For the game only, worked out on the CPU with the draw and read on the thread that draws it (a global written on
+    // the CPU's thread was another draw's by then, with the render thread): a small draw that is not flat, its extent in
+    // pixels (left > right when none; Spider-Man 2's tilted minimap), and whether its positions are in screen space.
+    float extent_left = 1, extent_right = 0, extent_top = 0, extent_bottom = 0;
+    bool screen_space = false;
 };
 
 // Fixed-function vertex transform done on the GPU: the state the CPU version (nv2a_kelvin.cpp) reads, laid out as
@@ -204,9 +209,8 @@ struct RendererNarrowing {
     float apply(float x) const { return anchor + (x - anchor) * factor; }
     float apply_y(float y) const { return anchor_y + (y - anchor_y) * factor_y; }
 };
-// For each draw: its extent on the surface (left > right when it is not flat) and its first texture's address.
-RendererNarrowing renderer_game_narrowing(const SurfaceState& surface, float left, float right, float top, float bottom,
-                                          uint32_t texture);
+// For each draw: its extent on the surface is state.screen_* (left > right when it is not flat).
+RendererNarrowing renderer_game_narrowing(const SurfaceState& surface, const DrawState& state);
 // For each clear of some channels (`channels`: NV097_CLEAR_SURFACE bits 4-7), the rectangle may grow.
 void renderer_game_clear(const SurfaceState& surface, uint32_t channels, int& x0, int& y0, int& x1, int& y1);
 // A texture to enlarge with sharp_2d although it is not on a flat draw.

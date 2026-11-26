@@ -3118,9 +3118,7 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
         const uint32_t address = stage.descriptor.address;  // a set lookup: most draws sample no depth buffer
         if (stage.enabled && g_zeta_addresses.count(address) && !g_targets.count(address)) refresh_depth_colour(address);
     }
-    const uint32_t texture = state.textures[0].enabled ? state.textures[0].descriptor.address : 0;
-    const RendererNarrowing hud = renderer_game_narrowing(surface, state.screen_left, state.screen_right,
-                                                          state.screen_top, state.screen_bottom, texture);
+    const RendererNarrowing hud = renderer_game_narrowing(surface, state);
     if (g_surface_scale_width != target->width || g_surface_scale_height != target->height ||
         g_surface_scale_pixels_x != surface.pixels_x || g_surface_scale_pixels_y != surface.pixels_y ||
         g_surface_scale_narrow != hud.factor || g_surface_scale_anchor != hud.anchor ||
