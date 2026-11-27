@@ -16,6 +16,7 @@
 #include "pc/kernel_internal.h"
 #include "pc/log.h"
 #include "pc/nv2a.h"
+#include "pc/paths.h"
 #include "pc/settings.h"
 
 namespace xport::pc {
@@ -192,9 +193,35 @@ uint32_t timezone_bias() {
     return static_cast<uint32_t>(zone.Bias + extra);
 }
 
+// XC_FACTORY_ETHERNET_ADDR, for System Link: 00:50:F2 (the prefix the game's own network driver uses when it has none)
+// and three bytes from this PC's name and the data folder, so that two copies of the game, on two PCs or with two data
+// folders, never share one, and each keeps its own from run to run. Never the PC's own address.
+void ethernet_address(uint8_t mac[6]) {
+    wchar_t computer[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD length = MAX_COMPUTERNAME_LENGTH + 1;
+    GetComputerNameW(computer, &length);
+    const std::wstring key = std::wstring(computer) + L"|" + data_directory().wstring();
+    uint32_t hash = 2166136261u;  // FNV-1a
+    for (wchar_t c : key) hash = (hash ^ static_cast<uint16_t>(c)) * 16777619u;
+    const uint8_t address[6] = {0x00, 0x50, 0xF2, static_cast<uint8_t>(hash >> 16), static_cast<uint8_t>(hash >> 8),
+                                static_cast<uint8_t>(hash)};
+    std::memcpy(mac, address, sizeof(address));
+}
+
 NTSTATUS __stdcall ExQueryNonVolatileSetting(uint32_t value_index, uint32_t* type, void* value, uint32_t value_length,
                                              uint32_t* result_length) {
     uint32_t dword = 0;
+    if (value_index == 0x101) {  // XC_FACTORY_ETHERNET_ADDR
+        uint8_t mac[6];
+        ethernet_address(mac);
+        if (type) *type = kRegBinary;
+        if (result_length) *result_length = sizeof(mac);
+        if (value_length < sizeof(mac)) return kStatusBufferTooSmall;
+        std::memcpy(value, mac, sizeof(mac));
+        log_line("ExQueryNonVolatileSetting: Ethernet address %02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3],
+                 mac[4], mac[5]);
+        return kStatusSuccess;
+    }
     switch (value_index) {
         case 0x0: dword = timezone_bias(); break;         // XC_TIMEZONE_BIAS
         case 0x7: dword = configured_language(); break;   // XC_LANGUAGE
