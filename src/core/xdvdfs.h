@@ -39,6 +39,9 @@ public:
 
     // Returns the number of bytes read, short at end of file and 0 on error.
     size_t read(const Entry& file, uint64_t offset, void* destination, size_t size) const;
+    // How long the calling thread's last read waited for another thread's read of the image to end, in
+    // microseconds: the reads take turns, so a short read of the music can wait behind a long one of the city.
+    static uint64_t last_read_wait_us();
     std::vector<uint8_t> read_all(const Entry& file) const;
 
     // The name of a file or directory that lies past the image's end, if there is one: the image is incomplete

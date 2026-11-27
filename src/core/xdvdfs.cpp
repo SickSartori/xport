@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 
 #include "core/byteorder.h"
@@ -259,8 +260,17 @@ std::optional<std::string> XdvdfsImage::entry_past_end() const {
     return std::nullopt;
 }
 
+namespace {
+thread_local uint64_t t_read_wait_us = 0;
+}
+
+uint64_t XdvdfsImage::last_read_wait_us() { return t_read_wait_us; }
+
 bool XdvdfsImage::read_raw(uint64_t offset, void* destination, size_t size) const {
+    const auto asked = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
+    t_read_wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - asked).count());
     auto* out = static_cast<uint8_t*>(destination);
     while (size) {
         const auto part = std::find_if(parts_.begin(), parts_.end(), [&](const Part& candidate) {
