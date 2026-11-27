@@ -1047,7 +1047,14 @@ std::unordered_map<uint32_t, uint32_t> g_queued_widths;  // by colour buffer: th
 void start_render_thread();
 void flush_queue();  // waits until everything queued is drawn; nothing to do on the render thread itself
 
-bool g_frame_scene = false;  // a draw in perspective since the last present (renderer_note_scene): not a film or loading screen
+// Per surface: a draw in perspective went into the frame drawn there (renderer_note_scene), so it is not a film or a
+// loading screen; and whether that frame was shown since (the next draw there starts a new frame). One flag for all
+// buffers was cleared by a present while the game was already drawing the next frame into another buffer: at 120 fps
+// that frame's scene could be done by then, and it was shown at 16:9 (21:9 flickered, mc3port report 158913).
+struct FrameScene {
+    bool scene = false, shown = false;
+};
+std::unordered_map<uint32_t, FrameScene> g_frame_scenes;
 float g_shown_aspect = 0;    // the shape the last frame was shown in (renderer_aspect, 16:9 at most without 3D)
 uint32_t g_picture_width = 0, g_picture_height = 0;  // the last frame shown
 ShownPicture g_shown_picture{};                       // and where it is in the window
@@ -3963,9 +3970,16 @@ float renderer_aspect() {
     return aspect;
 }
 
-void renderer_note_scene() { g_frame_scene = true; }
+bool renderer_scene_noted(uint32_t address) {
+    FrameScene& frame = g_frame_scenes[address];
+    if (frame.shown) frame = {};
+    return frame.scene;
+}
 
-bool renderer_scene_noted() { return g_frame_scene; }
+void renderer_note_scene(uint32_t address) {
+    renderer_scene_noted(address);
+    g_frame_scenes[address].scene = true;
+}
 
 ShownPicture renderer_shown_picture() { return g_shown_picture; }
 
@@ -4009,9 +4023,10 @@ void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_
         g_picture_width = width, g_picture_height = height;
         // A film or loading screen is made for 16:9 at most: wider screens show it with bars at the sides.
         const float previous_aspect = g_shown_aspect;
-        g_shown_aspect = g_frame_scene ? renderer_aspect() : std::min(renderer_aspect(), 16.0f / 9.0f);
+        FrameScene& drawn = g_frame_scenes[address];
+        g_shown_aspect = drawn.scene ? renderer_aspect() : std::min(renderer_aspect(), 16.0f / 9.0f);
         if (g_shown_aspect != previous_aspect) log_line("renderer: frames shown at %.3f", g_shown_aspect);
-        g_frame_scene = false;
+        drawn.shown = true;
         const float aspect = g_shown_aspect;
         float window_width = static_cast<float>(g_swap_width), window_height = static_cast<float>(g_swap_height);
         if (window_width > window_height * aspect) {
