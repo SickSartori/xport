@@ -1,6 +1,8 @@
 // The XBE parser and the disc images: XISO, full dump, split, CCI, and damaged ones.
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 
 #include "core/xbe.h"
 #include "core/xdvdfs.h"
@@ -117,6 +119,35 @@ void test_images(const std::filesystem::path& folder) {
         auto split = XdvdfsImage::open(folder / name, &error);
         CHECK(split != nullptr);
         if (split) check_sample(*split);
+    }
+
+    // Several threads reading the split image at once, each across the cut, as the game's threads do: every
+    // thread reads through files of its own, so they must all get the same bytes.
+    auto shared = XdvdfsImage::open(folder / "split.1.iso", &error);
+    CHECK(shared != nullptr);
+    if (shared) {
+        const auto big = shared->find("big.bin");
+        CHECK(big.has_value());
+        if (big) {
+            const std::vector<uint8_t> expected = sample_data();
+            std::atomic<int> wrong{0};
+            std::vector<std::thread> threads;
+            for (int t = 0; t < 4; ++t) {
+                threads.emplace_back([&, t] {
+                    for (int i = 0; i < 200; ++i) {
+                        const uint64_t at = static_cast<uint64_t>((i * 37 + t * 101) % 4900);
+                        uint8_t got[100] = {};
+                        if (shared->read(*big, at, got, sizeof(got)) != sizeof(got) ||
+                            !std::equal(got, got + sizeof(got), expected.begin() + static_cast<ptrdiff_t>(at))) {
+                            ++wrong;
+                        }
+                    }
+                });
+            }
+            for (std::thread& thread : threads) thread.join();
+            CHECK(wrong == 0);
+            CHECK(XdvdfsImage::last_read_wait_us() == 0);  // plain parts: no lock taken
+        }
     }
 }
 

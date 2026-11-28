@@ -40,7 +40,8 @@ public:
     // Returns the number of bytes read, short at end of file and 0 on error.
     size_t read(const Entry& file, uint64_t offset, void* destination, size_t size) const;
     // How long the calling thread's last read waited for another thread's read of the image to end, in
-    // microseconds: the reads take turns, so a short read of the music can wait behind a long one of the city.
+    // microseconds. Only compressed (CCI) parts still take turns; other parts are read by each thread with a file of
+    // its own, so this is 0 for them.
     static uint64_t last_read_wait_us();
     std::vector<uint8_t> read_all(const Entry& file) const;
 
@@ -53,6 +54,7 @@ private:
     // position of each 2048-byte sector (`sectors`, one more for the end), compressed with LZ4 where flagged.
     struct Part {
         std::FILE* file = nullptr;
+        std::filesystem::path path;  // opened again by each thread that reads it (read_raw)
         uint64_t start = 0;
         uint64_t size = 0;
         std::vector<uint32_t> sectors;
@@ -67,6 +69,7 @@ private:
     uint64_t partition_offset_ = 0;
     Entry root_;
     mutable std::mutex mutex_;  // the game reads from several threads
+    uint64_t id_ = 0;           // tells this image's files apart in each thread's own (read_raw)
 };
 
 }  // namespace xport

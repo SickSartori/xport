@@ -1,6 +1,7 @@
 #include "core/xdvdfs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -116,12 +117,53 @@ bool equals_ignore_case(std::string_view a, std::string_view b) {
 
 }  // namespace
 
+namespace {
+thread_local uint64_t t_read_wait_us = 0;
+
+// Each thread reads the plain parts of the image through files of its own, so no read waits for another. With one
+// file and one lock for every thread, a short read of the music (Midnight Club 3's XACT, asked by the thread that
+// makes the frame) could wait behind whoever held the lock, likely a thread of low priority on the game's only core,
+// preempted there for as long as Windows let the others run (not verified): 200 ms hitches at the same places of a race on a fast SSD that
+// went away with the music off (mc3port issue 29). Closed when the thread ends.
+struct ThreadFiles {
+    struct Open {
+        uint64_t image;
+        size_t part;
+        std::FILE* file;
+    };
+    std::vector<Open> open;
+    ~ThreadFiles() {
+        for (const Open& entry : open) std::fclose(entry.file);
+    }
+    std::FILE* get(uint64_t image, size_t part, const std::filesystem::path& path) {
+        for (const Open& entry : open) {
+            if (entry.image == image && entry.part == part) return entry.file;
+        }
+        std::FILE* file = open_file(path);
+        if (file) open.push_back({image, part, file});
+        return file;
+    }
+    // The calling thread's files of an image being closed (other threads close theirs when they end).
+    void forget(uint64_t image) {
+        std::erase_if(open, [image](const Open& entry) {
+            if (entry.image != image) return false;
+            std::fclose(entry.file);
+            return true;
+        });
+    }
+};
+thread_local ThreadFiles t_files;
+std::atomic<uint64_t> g_next_image_id{1};
+}
+
 std::unique_ptr<XdvdfsImage> XdvdfsImage::open(const std::filesystem::path& path, std::string* error) {
     std::unique_ptr<XdvdfsImage> image(new XdvdfsImage());
+    image->id_ = g_next_image_id++;
     uint64_t start = 0;
     for (const std::filesystem::path& file_path : image_files(path)) {
         Part& part = image->parts_.emplace_back();  // closed with the image, whatever happens next
         part.file = open_file(file_path);
+        part.path = file_path;
         if (!part.file) {
             if (error) *error = "cannot open " + path_to_utf8(file_path);
             return nullptr;
@@ -167,6 +209,7 @@ std::unique_ptr<XdvdfsImage> XdvdfsImage::open(const std::filesystem::path& path
 }
 
 XdvdfsImage::~XdvdfsImage() {
+    t_files.forget(id_);
     for (const Part& part : parts_) {
         if (part.file) std::fclose(part.file);
     }
@@ -260,13 +303,47 @@ std::optional<std::string> XdvdfsImage::entry_past_end() const {
     return std::nullopt;
 }
 
-namespace {
-thread_local uint64_t t_read_wait_us = 0;
-}
-
 uint64_t XdvdfsImage::last_read_wait_us() { return t_read_wait_us; }
 
 bool XdvdfsImage::read_raw(uint64_t offset, void* destination, size_t size) const {
+    t_read_wait_us = 0;
+    // Plain parts without the lock, each thread with its own files; compressed parts, and a part that cannot be
+    // opened again, through the shared files in turn.
+    bool plain = true;
+    for (uint64_t at = offset, left = size; left;) {
+        const auto part = std::find_if(parts_.begin(), parts_.end(), [&](const Part& candidate) {
+            return at >= candidate.start && at - candidate.start < candidate.size;
+        });
+        if (part == parts_.end()) return false;
+        if (!part->sectors.empty() || part->path.empty()) {
+            plain = false;
+            break;
+        }
+        const uint64_t count = std::min<uint64_t>(left, part->size - (at - part->start));
+        at += count;
+        left -= count;
+    }
+    if (plain) {
+        auto* out = static_cast<uint8_t*>(destination);
+        while (size) {
+            const auto part = std::find_if(parts_.begin(), parts_.end(), [&](const Part& candidate) {
+                return offset >= candidate.start && offset - candidate.start < candidate.size;
+            });
+            std::FILE* file = t_files.get(id_, static_cast<size_t>(part - parts_.begin()), part->path);
+            if (!file) {
+                plain = false;
+                break;
+            }
+            const uint64_t inside = offset - part->start;
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(size, part->size - inside));
+            if (!seek_file(file, inside) || std::fread(out, 1, count, file) != count) return false;
+            out += count;
+            offset += count;
+            size -= count;
+        }
+        if (plain) return true;
+        destination = out;
+    }
     const auto asked = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
     t_read_wait_us = static_cast<uint64_t>(
