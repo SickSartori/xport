@@ -4051,6 +4051,7 @@ void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_
         g_anisotropy && anisotropy != g_anisotropy) {
         g_samplers.clear();
         g_anisotropy = anisotropy;
+        log_line("renderer: anisotropy %u, the samplers made again", anisotropy);
         g_bound.valid = false;
     }
     // Setting render_thread 2: the two ways take turns every 4 s, with the draws and frames of each in the log. On a PC
