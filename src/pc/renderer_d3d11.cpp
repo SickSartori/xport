@@ -653,6 +653,7 @@ struct Statistics {
     // Parts of draw_ticks: target/shader lookup, vertex upload, state, textures (with state when not apart), the
     // Draw call.
     uint64_t part_ticks[5] = {};
+    uint64_t bind_ticks[6] = {};  // <GAME>_PROFILE_BIND: bind_draw_state in parts
     uint64_t swap_ticks = 0;  // in Present: long when the graphics card is behind
     uint64_t shader_waits = 0;  // draws left out while their combiner shader compiles (pixel_shader)
 } g_stats;
@@ -702,6 +703,13 @@ void log_statistics() {
              milliseconds(g_stats.part_ticks[2] + g_stats.part_ticks[3]) / seconds,
              milliseconds(g_stats.part_ticks[4]) / seconds, milliseconds(g_stats.swap_ticks) / seconds,
              static_cast<unsigned long long>(g_stats.shader_waits));
+    if (g_stats.bind_ticks[0] || g_stats.bind_ticks[4]) {
+        log_line("renderer: DEBUG bind per second: surface %.0f ms, states %.0f ms, constants %.0f ms, write tracking %.0f ms, "
+                 "texture views %.0f ms, binding %.0f ms",
+                 milliseconds(g_stats.bind_ticks[0]) / seconds, milliseconds(g_stats.bind_ticks[1]) / seconds,
+                 milliseconds(g_stats.bind_ticks[2]) / seconds, milliseconds(g_stats.bind_ticks[3]) / seconds,
+                 milliseconds(g_stats.bind_ticks[4]) / seconds, milliseconds(g_stats.bind_ticks[5]) / seconds);
+    }
     if (g_queue_on) {
         log_line("renderer: render thread: the GPU thread waited %.0f ms a second for it in %.0f of %.0f flushes, %.0f ms for "
                  "room in the queue",
@@ -1378,21 +1386,27 @@ ID3D11SamplerState* sampler(const TextureStage& stage) {
     return cached.Get();
 }
 
-// Current write-tracking generation, refreshed at most every 2 ms: a write that lands just after a refresh is
-// picked up by the next one.
+// Current write-tracking generation, refreshed every 2 ms: a write that lands just after a refresh is picked up by
+// the next one. GetWriteWatch over the whole physical memory takes about 0.17 ms, so the refresh runs on a thread of
+// its own (on the render thread it was 80-90 ms a second while driving); a draw takes the latest generation once,
+// before it reads any texture, so a write after that is newer than what the draw checked.
 uint32_t g_write_generation = 0;
-uint64_t g_write_refreshed_at = 0;
+std::atomic<uint32_t> g_refreshed_generation{0};
 
 void refresh_write_tracking() {
-    static const uint64_t interval = [] {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        return static_cast<uint64_t>(f.QuadPart) / 500;
+    static const bool started = [] {
+        g_refreshed_generation = refresh_physical_writes();
+        std::thread([] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+            for (;;) {
+                Sleep(2);
+                g_refreshed_generation.store(refresh_physical_writes(), std::memory_order_release);
+            }
+        }).detach();
+        return true;
     }();
-    const uint64_t now = ticks();
-    if (g_write_generation && now - g_write_refreshed_at < interval) return;
-    g_write_generation = refresh_physical_writes();
-    g_write_refreshed_at = now;
+    (void)started;
+    g_write_generation = g_refreshed_generation.load(std::memory_order_acquire);
 }
 
 // textures_replace\<hash>.png (or .jpg) in the data folder: a picture drawn instead of the game's texture whose
@@ -3119,6 +3133,14 @@ ID3D11ShaderResourceView* target_copy(const Target& target) {
 
 // Render target, viewport, scissor, raster, blend, depth state, combiner constants, textures and samplers.
 void bind_draw_state(const SurfaceState& surface, const DrawState& state, const PreparedDraw& draw) {
+    static const bool profile_bind = GetEnvironmentVariableA(XPORT_ENV("PROFILE_BIND"), nullptr, 0) != 0;
+    uint64_t bind_mark = profile_bind ? ticks() : 0;
+    const auto bind_part = [&](int index) {
+        if (!profile_bind) return;
+        const uint64_t now = ticks();
+        g_stats.bind_ticks[index] += now - bind_mark;
+        bind_mark = now;
+    };
     Target* target = draw.target;
     // A depth buffer sampled as a texture: copied as colour first (this binds its own state, so before ours).
     for (const TextureStage& stage : state.textures) {
@@ -3177,6 +3199,7 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
         g_context->RSSetScissorRects(1, &scissor);
         bound.scissor = scissor;
     }
+    bind_part(0);
     if (ID3D11RasterizerState* rasterizer = rasterizer_for(state); !bound.valid || rasterizer != bound.rasterizer) {
         g_context->RSSetState(rasterizer);
         bound.rasterizer = rasterizer;
@@ -3204,6 +3227,7 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
         bound.stencil_reference = state.stencil_reference;
     }
 
+    bind_part(1);
     // A linear texture is addressed in texels; when it is one of our render targets, its real width (from the
     // surface pitch) can be larger than the texture's rectangle, so normalise by the render target's size.
     CombinerConstants constants_data = state.constants;
@@ -3232,9 +3256,11 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
         bound.constants = constants_data;
     }
 
+    bind_part(2);
     ID3D11ShaderResourceView* views[4] = {};
     ID3D11SamplerState* samplers[4] = {};
     refresh_write_tracking();
+    bind_part(3);
     for (int i = 0; i < 4; ++i) {
         if (!state.textures[i].enabled) continue;
         views[i] = texture_view(state.textures[i], state.screen_left <= state.screen_right);
@@ -3255,6 +3281,7 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
             g_self_read_surface = surface.color_address;
         }
     }
+    bind_part(4);
     if (!bound.valid || std::memcmp(views, bound.views, sizeof(views)) != 0) {
         g_context->PSSetShaderResources(0, 4, views);
         std::memcpy(bound.views, views, sizeof(views));
@@ -3268,6 +3295,7 @@ void bind_draw_state(const SurfaceState& surface, const DrawState& state, const 
         bound.shader = draw.shader;
     }
     bound.valid = true;
+    bind_part(5);
 }
 
 // Appends `bytes` to a dynamic ring buffer: written without waiting (NO_OVERWRITE), renamed (DISCARD) only when
