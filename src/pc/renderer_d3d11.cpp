@@ -645,6 +645,7 @@ std::map<std::tuple<bool, uint32_t, bool, bool, uint32_t, uint32_t, uint32_t, ui
          ComPtr<ID3D11DepthStencilState>>
     g_depth_states;
 std::map<std::pair<uint32_t, uint32_t>, ComPtr<ID3D11SamplerState>> g_samplers;
+UINT g_anisotropy = 0;  // setting anisotropy, as the samplers in g_samplers were made (0: not read yet)
 
 // Statistics, logged every 10 s from renderer_present: where the GPU thread's time goes.
 struct Statistics {
@@ -654,6 +655,7 @@ struct Statistics {
     // Draw call.
     uint64_t part_ticks[5] = {};
     uint64_t bind_ticks[6] = {};  // <GAME>_PROFILE_BIND: bind_draw_state in parts
+    uint64_t upload_ticks_parts[4] = {};  // and the vertex data upload: attributes, indices, constants, draw constant
     uint64_t swap_ticks = 0;  // in Present: long when the graphics card is behind
     uint64_t shader_waits = 0;  // draws left out while their combiner shader compiles (pixel_shader)
 } g_stats;
@@ -709,6 +711,9 @@ void log_statistics() {
                  milliseconds(g_stats.bind_ticks[0]) / seconds, milliseconds(g_stats.bind_ticks[1]) / seconds,
                  milliseconds(g_stats.bind_ticks[2]) / seconds, milliseconds(g_stats.bind_ticks[3]) / seconds,
                  milliseconds(g_stats.bind_ticks[4]) / seconds, milliseconds(g_stats.bind_ticks[5]) / seconds);
+        log_line("renderer: DEBUG upload per second: attributes %.0f ms, indices %.0f ms, constants %.0f ms, draw constant %.0f ms",
+                 milliseconds(g_stats.upload_ticks_parts[0]) / seconds, milliseconds(g_stats.upload_ticks_parts[1]) / seconds,
+                 milliseconds(g_stats.upload_ticks_parts[2]) / seconds, milliseconds(g_stats.upload_ticks_parts[3]) / seconds);
     }
     if (g_queue_on) {
         log_line("renderer: render thread: the GPU thread waited %.0f ms a second for it in %.0f of %.0f flushes, %.0f ms for "
@@ -1356,7 +1361,8 @@ ID3D11SamplerState* sampler(const TextureStage& stage) {
     desc.Filter = kFilters[(linear_min ? 4 : 0) | (linear_mag ? 2 : 0) | (linear_mip ? 1 : 0)];
     // Smooth (trilinear) filtering becomes anisotropic: textures seen at a slant (roads, walls) stay sharp
     // (setting anisotropy, 1..16, 1 = off).
-    static const UINT anisotropy = std::clamp<UINT>(static_cast<UINT>(setting_at_start("anisotropy")), 1, 16);
+    if (!g_anisotropy) g_anisotropy = std::clamp<UINT>(static_cast<UINT>(setting("anisotropy")), 1, 16);
+    const UINT anisotropy = g_anisotropy;
     if (linear_min && linear_mag && mipmaps && anisotropy > 1) {
         desc.Filter = D3D11_FILTER_ANISOTROPIC;
         desc.MaxAnisotropy = anisotropy;
@@ -3381,22 +3387,34 @@ void draw_vertex_data(const SurfaceState& surface, const DrawState& state, ID3D1
     if (!prepare_draw(surface, state, draw)) return;
     uint64_t mark = ticks();
     g_stats.part_ticks[0] += mark - draw_start;
+    static const bool profile_upload = GetEnvironmentVariableA(XPORT_ENV("PROFILE_BIND"), nullptr, 0) != 0;
+    uint64_t upload_mark = mark;
+    const auto upload_part = [&](int index) {
+        if (!profile_upload) return;
+        const uint64_t now = ticks();
+        g_stats.upload_ticks_parts[index] += now - upload_mark;
+        upload_mark = now;
+    };
     uint32_t first = 0;
     if (vertex_bytes) {
         first = ring_append(g_attribute_ring, vertex_data, vertex_bytes, D3D11_BIND_SHADER_RESOURCE, 4);
         if (first == ~0u) return;
     }
+    upload_part(0);
     const uint32_t index_offset = ring_append(g_index_ring, indices, index_count * 4,
                                               D3D11_BIND_INDEX_BUFFER, 4);
     if (index_offset == ~0u) return;
+    upload_part(1);
     // The transform state changes far less often than draws: uploaded only when different.
     if (!valid || std::memcmp(&constants, &uploaded, sizeof(constants)) != 0) {
         g_context->UpdateSubresource(buffer, 0, nullptr, &constants, 0, 0);
         uploaded = constants;
         valid = true;
     }
+    upload_part(2);
     const uint32_t draw_constants[4] = {first, 0, 0, 0};
     g_context->UpdateSubresource(g_fixed_function_draw_constants.Get(), 0, nullptr, draw_constants, 0, 0);
+    upload_part(3);
     const uint64_t uploaded_at = ticks();
     g_stats.part_ticks[1] += uploaded_at - mark;
     bind_draw_state(surface, state, draw);
@@ -4028,6 +4046,13 @@ void renderer_set_overlay(RendererOverlay overlay) { g_overlay = overlay; }
 
 void renderer_present(uint32_t address, uint32_t width, uint32_t height, uint32_t pitch) {
     flush_queue();  // the frame is whole before it is shown
+    // Setting anisotropy changed in the menus: the samplers are made again (no draw is queued now).
+    if (const UINT anisotropy = std::clamp<UINT>(static_cast<UINT>(setting("anisotropy")), 1, 16);
+        g_anisotropy && anisotropy != g_anisotropy) {
+        g_samplers.clear();
+        g_anisotropy = anisotropy;
+        g_bound.valid = false;
+    }
     // Setting render_thread 2: the two ways take turns every 4 s, with the draws and frames of each in the log. On a PC
     // whose speed swings from one run to the next it is the comparison that can be read: the same scene, the same moment.
     if (g_queue_alternates) {
